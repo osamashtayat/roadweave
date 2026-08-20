@@ -6,6 +6,14 @@ public class ClickablePart : MonoBehaviour
 
     private void OnMouseDown()
     {
+        // Use the live replay dashboard when the new RoadWeave system is present.
+        // The old single-JSON display remains below as a temporary fallback.
+        if (TwinDashboard.Instance != null &&
+            TwinDashboard.Instance.SelectComponent(componentId))
+        {
+            return;
+        }
+
         if (componentId == "vehicle_body")
         {
             ShowVehicleBody();
@@ -26,6 +34,13 @@ public class ClickablePart : MonoBehaviour
 
     private void ShowVehicleBody()
     {
+        if (DigitalTwinDataManager.Instance == null ||
+            DigitalTwinDataManager.Instance.Data == null)
+        {
+            Debug.LogWarning("No digital twin data manager is available.");
+            return;
+        }
+
         VehicleBodyData body =
             DigitalTwinDataManager.Instance.Data.vehicle_body;
 
@@ -49,6 +64,12 @@ public class ClickablePart : MonoBehaviour
 
     private void ShowWheel()
     {
+        if (DigitalTwinDataManager.Instance == null)
+        {
+            Debug.LogWarning("No digital twin data manager is available.");
+            return;
+        }
+
         WheelData wheel =
             DigitalTwinDataManager.Instance.GetWheel(componentId);
 
@@ -73,6 +94,12 @@ public class ClickablePart : MonoBehaviour
 
     private void ShowSensor()
     {
+        if (DigitalTwinDataManager.Instance == null)
+        {
+            Debug.LogWarning("No digital twin data manager is available.");
+            return;
+        }
+
         VehicleSensorData sensor =
             DigitalTwinDataManager.Instance.GetSensor(componentId);
 

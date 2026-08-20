@@ -1,0 +1,20 @@
+fileFormatVersion: 2
+guid: 578d957603bd14f7d978ca33acc2443b
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences:
+  - stateManager: {instanceID: 0}
+  - runtimeActorsRoot: {instanceID: 0}
+  - carPrefab: {fileID: 8771091787928289351, guid: b5e6d5ef0a7ab46c88e6bbcdc00b8f1d, type: 3}
+  - truckPrefab: {instanceID: 0}
+  - busPrefab: {instanceID: 0}
+  - constructionVehiclePrefab: {instanceID: 0}
+  - pedestrianPrefab: {instanceID: 0}
+  - trafficConePrefab: {instanceID: 0}
+  - genericObjectPrefab: {instanceID: 0}
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
