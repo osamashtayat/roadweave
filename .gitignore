@@ -107,3 +107,20 @@ InitTestScene*.unity*
 
 .DS_Store
 .vscode/
+
+# Imported model source archives are recovery inputs, not Unity runtime assets.
+# This prevents newly downloaded archives from bloating future commits. Files
+# already tracked by Git remain preserved until the owner deliberately migrates
+# them to Git LFS or an external release archive.
+*.zip
+*.zip.meta
+*.7z
+*.7z.meta
+*.rar
+*.rar.meta
+*.tar
+*.tar.meta
+*.tgz
+*.tgz.meta
+*.gz
+*.gz.meta

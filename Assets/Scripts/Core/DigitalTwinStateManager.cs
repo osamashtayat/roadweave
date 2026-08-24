@@ -1,22 +1,64 @@
 using System;
 using UnityEngine;
 
-public class DigitalTwinStateManager : MonoBehaviour
+/// <summary>
+/// Source-neutral current-state store. Every Unity presentation component reads
+/// the same accepted TwinSnapshot regardless of its source.
+/// </summary>
+public class DigitalTwinStateManager : MonoBehaviour, ITwinSnapshotSink
 {
     public static DigitalTwinStateManager Instance { get; private set; }
 
+    [Header("Streaming Safety")]
+    [SerializeField, Min(0.05f)] private float defaultStaleAfterSeconds = 1f;
+    [SerializeField] private bool rejectOutOfOrderSnapshots = true;
+
+    // Transitional replay-only access for components not yet migrated.
     public ReplayPackage Package { get; private set; }
-    public TwinEgoState Ego { get; } = new TwinEgoState();
-    public TwinVehicleState Vehicle { get; } = new TwinVehicleState();
-    public TwinWheelState Wheels { get; } = new TwinWheelState();
+
+    public TwinSnapshot CurrentSnapshot { get; private set; }
+    public TwinEgoState Ego => CurrentSnapshot?.ego ?? emptyEgo;
+    public TwinVehicleState Vehicle => CurrentSnapshot?.vehicle ?? emptyVehicle;
+    public TwinWheelState Wheels => CurrentSnapshot?.wheels ?? emptyWheels;
+    public TwinActorState[] Actors => CurrentSnapshot?.actors ?? emptyActors;
+    public TwinSnapshotMetadata Metadata => CurrentSnapshot?.metadata;
+    public TwinSessionInfo Session { get; private set; } = new TwinSessionInfo
+    {
+        status = TwinSessionStatus.Disconnected,
+        sourceKind = TwinSourceKind.Unknown
+    };
+
     public ReplayStatus Status { get; private set; } = ReplayStatus.Loading;
-    public float CurrentTime { get; private set; }
-    public bool IsReady => Package != null && Status != ReplayStatus.Error;
-    public bool IsPlaying => Status == ReplayStatus.Playing;
+    public float CurrentTime => CurrentSnapshot == null ? 0f : (float)CurrentSnapshot.metadata.sourceTimestampSeconds;
+    /// <summary>
+    /// Source time without the precision loss of the legacy float CurrentTime API.
+    /// Use this for integration/delta calculations, especially with Unix timestamps.
+    /// </summary>
+    public double CurrentSourceTimestampSeconds =>
+        CurrentSnapshot?.metadata == null ? 0d : CurrentSnapshot.metadata.sourceTimestampSeconds;
+    public bool IsReady => CurrentSnapshot != null &&
+                           CurrentSnapshot.metadata.validity != TwinDataValidity.Invalid &&
+                           Session.status != TwinSessionStatus.Error;
+    public bool IsPlaying => Session.status == TwinSessionStatus.Running;
+    public bool IsFresh => CurrentSnapshot != null && CurrentSnapshot.metadata.freshness == TwinDataFreshness.Fresh;
+    public ITwinSessionControl SessionControl => connectedSource as ITwinSessionControl;
+    public ITwinStateSource ConnectedSource => connectedSource;
 
     public event Action Initialized;
     public event Action StateUpdated;
+    public event Action<TwinSnapshot> SnapshotUpdated;
     public event Action<ReplayStatus> StatusChanged;
+    public event Action<TwinSessionInfo> SessionChanged;
+    public event Action<ITwinStateSource> SourceChanged;
+
+    private static readonly TwinEgoState emptyEgo = new TwinEgoState();
+    private static readonly TwinVehicleState emptyVehicle = new TwinVehicleState();
+    private static readonly TwinWheelState emptyWheels = new TwinWheelState();
+    private static readonly TwinActorState[] emptyActors = Array.Empty<TwinActorState>();
+    private ITwinStateSource connectedSource;
+    private string acceptedSessionId;
+    private long acceptedSequence = -1;
+    private bool initializedRaised;
 
     private void Awake()
     {
@@ -26,152 +68,319 @@ public class DigitalTwinStateManager : MonoBehaviour
             Destroy(this);
             return;
         }
-
         Instance = this;
     }
 
+    private void Update() => RefreshFreshness();
+
     private void OnDestroy()
     {
-        if (Instance == this)
-            Instance = null;
+        DisconnectSource();
+        if (Instance == this) Instance = null;
     }
 
+    public void ConnectSource(ITwinStateSource source)
+    {
+        if (ReferenceEquals(connectedSource, source)) return;
+        DetachConnectedSource(false);
+        connectedSource = source;
+        ResetAcceptedSourceState(true);
+        if (connectedSource == null)
+        {
+            PublishDisconnectedSession();
+            SourceChanged?.Invoke(null);
+            return;
+        }
+        connectedSource.SnapshotProduced += OnSourceSnapshot;
+        connectedSource.SessionChanged += PublishSessionStatus;
+        if (connectedSource.Session != null) PublishSessionStatus(connectedSource.Session);
+        SourceChanged?.Invoke(connectedSource);
+    }
+
+    public void DisconnectSource()
+    {
+        DetachConnectedSource(true);
+    }
+
+    public void DisconnectSource(ITwinStateSource source)
+    {
+        if (ReferenceEquals(connectedSource, source))
+            DisconnectSource();
+    }
+
+    private void OnSourceSnapshot(TwinSnapshot snapshot) => PublishSnapshot(snapshot);
+
+    public bool PublishSnapshot(TwinSnapshot snapshot)
+    {
+        if (!ValidateSnapshot(snapshot, out string validationError))
+        {
+            Debug.LogWarning($"Rejected digital-twin snapshot: {validationError}");
+            return false;
+        }
+
+        string sessionId = snapshot.metadata.session.sessionId ?? string.Empty;
+        if (!string.Equals(sessionId, acceptedSessionId, StringComparison.Ordinal))
+        {
+            acceptedSessionId = sessionId;
+            acceptedSequence = -1;
+            initializedRaised = false;
+        }
+
+        if (rejectOutOfOrderSnapshots && snapshot.metadata.sequenceNumber <= acceptedSequence)
+        {
+            Debug.LogWarning($"Rejected out-of-order snapshot {snapshot.metadata.sequenceNumber}; last accepted is {acceptedSequence}.");
+            return false;
+        }
+
+        snapshot.metadata.receiptTimestampSeconds = Time.realtimeSinceStartup;
+        if (snapshot.metadata.staleAfterSeconds <= 0f) snapshot.metadata.staleAfterSeconds = defaultStaleAfterSeconds;
+        // Receipt of a message can establish freshness only when the source did
+        // not already declare it stale. Never relabel upstream-stale data Fresh.
+        if (snapshot.metadata.freshness == TwinDataFreshness.Unknown)
+            snapshot.metadata.freshness = TwinDataFreshness.Fresh;
+        snapshot.actors = snapshot.actors ?? emptyActors;
+        acceptedSequence = snapshot.metadata.sequenceNumber;
+        CurrentSnapshot = snapshot;
+        PublishSessionStatus(snapshot.metadata.session);
+
+        if (!initializedRaised)
+        {
+            initializedRaised = true;
+            Initialized?.Invoke();
+        }
+        StateUpdated?.Invoke();
+        SnapshotUpdated?.Invoke(CurrentSnapshot);
+        return true;
+    }
+
+    public void PublishSessionStatus(TwinSessionInfo session)
+    {
+        if (session == null) return;
+        Session = session;
+        ReplayStatus compatibilityStatus = ToReplayStatus(session.status);
+        bool changed = Status != compatibilityStatus;
+        Status = compatibilityStatus;
+        SessionChanged?.Invoke(Session);
+        if (changed) StatusChanged?.Invoke(Status);
+    }
+
+    /// <summary>
+    /// Attaches replay-only compatibility data only when its owner is the active
+    /// replay source. This prevents a replay finishing an asynchronous load from
+    /// contaminating an active simulated/live session.
+    /// </summary>
+    public bool AttachReplayPackage(ReplayPackage replayPackage, ITwinStateSource owner)
+    {
+        if (replayPackage == null || owner == null ||
+            !ReferenceEquals(connectedSource, owner) ||
+            owner.Session?.sourceKind != TwinSourceKind.Replay)
+            return false;
+        Package = replayPackage;
+        return true;
+    }
+
+    // Compatibility entry point for existing scenes. New replay code samples in its adapter.
     public void Initialize(ReplayPackage replayPackage)
     {
+        if (connectedSource != null && connectedSource.Session?.sourceKind != TwinSourceKind.Replay)
+        {
+            Debug.LogWarning("Ignored legacy replay initialization while a non-replay source is active.");
+            return;
+        }
+        if (!ReplaySnapshotSampler.ValidatePackage(replayPackage, out TwinCoordinateFrame frame, out string error))
+        {
+            Debug.LogError(error);
+            SetError();
+            return;
+        }
+        // Explicit legacy entry point: there is no source object to own the
+        // package, so keep this compatibility path local to the state manager.
         Package = replayPackage;
-        CurrentTime = 0f;
-        UpdateState(0f);
-        SetStatus(ReplayStatus.Ready);
-        Initialized?.Invoke();
+        TwinSessionInfo replaySession = CreateCompatibilityReplaySession(replayPackage, TwinSessionStatus.Ready);
+        acceptedSessionId = null;
+        acceptedSequence = -1;
+        PublishSnapshot(ReplaySnapshotSampler.Sample(replayPackage, frame, 0f, 0, replaySession));
+    }
+
+    // Compatibility sampling for older callers.
+    public void UpdateState(float replayTime)
+    {
+        string error = Package == null ? "No compatibility replay package is attached." : null;
+        TwinCoordinateFrame frame = null;
+        if (Package == null || !ReplaySnapshotSampler.ValidatePackage(Package, out frame, out error))
+        {
+            if (!string.IsNullOrEmpty(error)) Debug.LogWarning(error);
+            return;
+        }
+        TwinSessionInfo session = Session.sourceKind == TwinSourceKind.Replay
+            ? Session
+            : CreateCompatibilityReplaySession(Package, TwinSessionStatus.Ready);
+        PublishSnapshot(ReplaySnapshotSampler.Sample(Package, frame, replayTime, acceptedSequence + 1, session));
     }
 
     public void SetStatus(ReplayStatus newStatus)
     {
-        if (Status == newStatus)
-            return;
-
-        Status = newStatus;
-        StatusChanged?.Invoke(Status);
+        TwinSessionInfo next = CopySession(Session);
+        next.status = FromReplayStatus(newStatus);
+        PublishSessionStatus(next);
+        if (CurrentSnapshot?.metadata != null) CurrentSnapshot.metadata.session = CopySession(next);
     }
 
     public void SetError()
     {
-        SetStatus(ReplayStatus.Error);
-    }
-
-    public void UpdateState(float replayTime)
-    {
-        if (Package == null)
-            return;
-
-        CurrentTime = Mathf.Clamp(replayTime, 0f, Package.durationSeconds);
-        SampleEgo(CurrentTime);
-        SampleVehicle(CurrentTime);
-        SampleWheels(CurrentTime);
-        StateUpdated?.Invoke();
-    }
-
-    private void SampleEgo(float time)
-    {
-        EgoReplayFrame[] frames = Package.egoFrames;
-        if (frames == null || frames.Length == 0)
-            return;
-
-        FindEgoPair(frames, time, out EgoReplayFrame from, out EgoReplayFrame to, out float t);
-        Ego.position = Vector3.Lerp(from.position.ToVector3(), to.position.ToVector3(), t);
-        Ego.yawDegrees = Mathf.LerpAngle(from.yawDegrees, to.yawDegrees, t);
-        Ego.speedMetersPerSecond = Mathf.Lerp(from.speedMetersPerSecond, to.speedMetersPerSecond, t);
-        Ego.longitudinalAcceleration = Mathf.Lerp(from.longitudinalAcceleration, to.longitudinalAcceleration, t);
-    }
-
-    private void SampleVehicle(float time)
-    {
-        VehicleReplayFrame[] frames = Package.vehicleFrames;
-        if (frames == null || frames.Length == 0)
-            return;
-
-        FindVehiclePair(frames, time, out VehicleReplayFrame from, out VehicleReplayFrame to, out float t);
-        Vehicle.speedKilometersPerHour = Mathf.Lerp(from.speedKilometersPerHour, to.speedKilometersPerHour, t);
-        Vehicle.batteryPercent = Mathf.Lerp(from.batteryPercent, to.batteryPercent, t);
-        Vehicle.availableDistanceKilometers = Mathf.Lerp(from.availableDistanceKilometers, to.availableDistanceKilometers, t);
-        Vehicle.gearPosition = from.gearPosition;
-        Vehicle.throttlePercent = Mathf.Lerp(from.throttlePercent, to.throttlePercent, t);
-        Vehicle.brake = Mathf.Lerp(from.brake, to.brake, t);
-        Vehicle.brakeSwitch = from.brakeSwitch;
-        Vehicle.steeringDegrees = Mathf.Lerp(from.steeringDegrees, to.steeringDegrees, t);
-        Vehicle.steeringSpeed = Mathf.Lerp(from.steeringSpeed, to.steeringSpeed, t);
-        Vehicle.yawRate = Mathf.Lerp(from.yawRate, to.yawRate, t);
-        Vehicle.leftSignal = from.leftSignal;
-        Vehicle.rightSignal = from.rightSignal;
-    }
-
-    private void SampleWheels(float time)
-    {
-        WheelReplayFrame[] frames = Package.wheelFrames;
-        if (frames == null || frames.Length == 0)
-            return;
-
-        FindWheelPair(frames, time, out WheelReplayFrame from, out WheelReplayFrame to, out float t);
-        Wheels.frontLeftRpm = Mathf.Lerp(from.frontLeftRpm, to.frontLeftRpm, t);
-        Wheels.frontRightRpm = Mathf.Lerp(from.frontRightRpm, to.frontRightRpm, t);
-        Wheels.rearLeftRpm = Mathf.Lerp(from.rearLeftRpm, to.rearLeftRpm, t);
-        Wheels.rearRightRpm = Mathf.Lerp(from.rearRightRpm, to.rearRightRpm, t);
-    }
-
-    private static int FindLowerIndex(float time, int length, Func<int, float> getTime)
-    {
-        if (length <= 1 || time <= getTime(0))
-            return 0;
-
-        if (time >= getTime(length - 1))
-            return length - 1;
-
-        int low = 0;
-        int high = length - 1;
-
-        while (low <= high)
+        TwinSessionInfo next = CopySession(Session);
+        next.status = TwinSessionStatus.Error;
+        if (string.IsNullOrEmpty(next.statusMessage)) next.statusMessage = "The active source reported an error.";
+        PublishSessionStatus(next);
+        if (CurrentSnapshot != null)
         {
-            int middle = (low + high) / 2;
-            if (getTime(middle) <= time)
-                low = middle + 1;
-            else
-                high = middle - 1;
+            CurrentSnapshot.metadata.validity = TwinDataValidity.Invalid;
+            CurrentSnapshot.metadata.validityMessage = next.statusMessage;
         }
-
-        return Mathf.Clamp(high, 0, length - 1);
     }
 
-    private static float Interpolation(float time, float fromTime, float toTime)
+    private void RefreshFreshness()
     {
-        if (Mathf.Approximately(fromTime, toTime))
-            return 0f;
-        return Mathf.InverseLerp(fromTime, toTime, time);
+        if (CurrentSnapshot?.metadata == null || CurrentSnapshot.metadata.freshness == TwinDataFreshness.Stale) return;
+        // Replay remains deterministic when paused. Streaming data must age out,
+        // including after a live/simulated source is paused or stopped.
+        if (Session.sourceKind == TwinSourceKind.Replay) return;
+        double age = Time.realtimeSinceStartup - CurrentSnapshot.metadata.receiptTimestampSeconds;
+        if (age <= CurrentSnapshot.metadata.staleAfterSeconds) return;
+        CurrentSnapshot.metadata.freshness = TwinDataFreshness.Stale;
+        foreach (TwinActorState actor in CurrentSnapshot.actors ?? emptyActors)
+        {
+            if (actor != null)
+                actor.freshness = TwinDataFreshness.Stale;
+        }
+        StateUpdated?.Invoke();
+        SnapshotUpdated?.Invoke(CurrentSnapshot);
     }
 
-    private static void FindEgoPair(EgoReplayFrame[] frames, float time, out EgoReplayFrame from, out EgoReplayFrame to, out float t)
+    private void DetachConnectedSource(bool publishDisconnected)
     {
-        int fromIndex = FindLowerIndex(time, frames.Length, index => frames[index].time);
-        int toIndex = Mathf.Min(fromIndex + 1, frames.Length - 1);
-        from = frames[fromIndex];
-        to = frames[toIndex];
-        t = Interpolation(time, from.time, to.time);
+        if (connectedSource != null)
+        {
+            connectedSource.SnapshotProduced -= OnSourceSnapshot;
+            connectedSource.SessionChanged -= PublishSessionStatus;
+            connectedSource = null;
+        }
+        if (!publishDisconnected)
+            return;
+        ResetAcceptedSourceState(true);
+        PublishDisconnectedSession();
+        SourceChanged?.Invoke(null);
     }
 
-    private static void FindVehiclePair(VehicleReplayFrame[] frames, float time, out VehicleReplayFrame from, out VehicleReplayFrame to, out float t)
+    private void ResetAcceptedSourceState(bool publishUnavailable)
     {
-        int fromIndex = FindLowerIndex(time, frames.Length, index => frames[index].time);
-        int toIndex = Mathf.Min(fromIndex + 1, frames.Length - 1);
-        from = frames[fromIndex];
-        to = frames[toIndex];
-        t = Interpolation(time, from.time, to.time);
+        acceptedSessionId = null;
+        acceptedSequence = -1;
+        initializedRaised = false;
+        CurrentSnapshot = null;
+        Package = null;
+        if (publishUnavailable)
+        {
+            StateUpdated?.Invoke();
+            SnapshotUpdated?.Invoke(null);
+        }
     }
 
-    private static void FindWheelPair(WheelReplayFrame[] frames, float time, out WheelReplayFrame from, out WheelReplayFrame to, out float t)
+    private void PublishDisconnectedSession()
     {
-        int fromIndex = FindLowerIndex(time, frames.Length, index => frames[index].time);
-        int toIndex = Mathf.Min(fromIndex + 1, frames.Length - 1);
-        from = frames[fromIndex];
-        to = frames[toIndex];
-        t = Interpolation(time, from.time, to.time);
+        PublishSessionStatus(new TwinSessionInfo
+        {
+            sourceKind = TwinSourceKind.Unknown,
+            status = TwinSessionStatus.Disconnected,
+            statusMessage = "No digital-twin source is connected."
+        });
+    }
+
+    private static bool ValidateSnapshot(TwinSnapshot snapshot, out string error)
+    {
+        if (snapshot == null) { error = "Snapshot is null."; return false; }
+        if (snapshot.metadata == null) { error = "Metadata is missing."; return false; }
+        if (snapshot.metadata.session == null) { error = "Session metadata is missing."; return false; }
+        if (string.IsNullOrWhiteSpace(snapshot.metadata.session.sessionId)) { error = "Session ID is required."; return false; }
+        if (!TwinCoordinateFrameService.IsCanonical(snapshot.metadata.coordinateFrame)) { error = "Snapshot is not in the canonical RoadWeave coordinate frame."; return false; }
+        if (snapshot.ego == null || snapshot.vehicle == null || snapshot.wheels == null) { error = "Ego, vehicle, and wheel groups must be present; mark unavailable groups Invalid."; return false; }
+        if (snapshot.metadata.validity == TwinDataValidity.Unknown) { error = "Snapshot validity must be explicitly Valid or Partial."; return false; }
+        if (snapshot.metadata.validity == TwinDataValidity.Invalid) { error = snapshot.metadata.validityMessage ?? "Source marked the snapshot invalid."; return false; }
+        if (!HasExplicitValidity(snapshot.ego.validity) ||
+            !HasExplicitValidity(snapshot.vehicle.validity) ||
+            !HasExplicitValidity(snapshot.wheels.validity))
+        {
+            error = "Ego, vehicle, and wheel validity must each be explicitly Valid, Partial, or Invalid.";
+            return false;
+        }
+        if (snapshot.metadata.validity == TwinDataValidity.Valid &&
+            (snapshot.ego.validity != TwinDataValidity.Valid ||
+             snapshot.vehicle.validity != TwinDataValidity.Valid ||
+             snapshot.wheels.validity != TwinDataValidity.Valid))
+        {
+            error = "A Valid snapshot cannot contain a Partial or Invalid required data group; mark the snapshot Partial.";
+            return false;
+        }
+        error = null;
+        return true;
+    }
+
+    private static bool HasExplicitValidity(TwinDataValidity validity) =>
+        validity == TwinDataValidity.Valid ||
+        validity == TwinDataValidity.Partial ||
+        validity == TwinDataValidity.Invalid;
+
+    private static TwinSessionInfo CreateCompatibilityReplaySession(ReplayPackage package, TwinSessionStatus status)
+    {
+        return new TwinSessionInfo
+        {
+            sourceId = string.IsNullOrWhiteSpace(package.source) ? "replay" : package.source,
+            sessionId = string.IsNullOrWhiteSpace(package.sceneId) ? "legacy-replay" : package.sceneId,
+            sourceKind = TwinSourceKind.Replay,
+            status = status,
+            capabilities = TwinSourceCapabilities.EgoPose | TwinSourceCapabilities.VehicleTelemetry |
+                           TwinSourceCapabilities.WheelTelemetry | TwinSourceCapabilities.SurroundingActors |
+                           TwinSourceCapabilities.Seek | TwinSourceCapabilities.Pause |
+                           TwinSourceCapabilities.FutureTrajectory
+        };
+    }
+
+    private static TwinSessionInfo CopySession(TwinSessionInfo session)
+    {
+        return new TwinSessionInfo
+        {
+            sourceId = session?.sourceId,
+            sessionId = session?.sessionId,
+            sourceKind = session?.sourceKind ?? TwinSourceKind.Unknown,
+            status = session?.status ?? TwinSessionStatus.Disconnected,
+            capabilities = session?.capabilities ?? TwinSourceCapabilities.None,
+            statusMessage = session?.statusMessage
+        };
+    }
+
+    private static ReplayStatus ToReplayStatus(TwinSessionStatus status)
+    {
+        switch (status)
+        {
+            case TwinSessionStatus.Ready: return ReplayStatus.Ready;
+            case TwinSessionStatus.Running: return ReplayStatus.Playing;
+            case TwinSessionStatus.Paused: return ReplayStatus.Paused;
+            case TwinSessionStatus.Finished: return ReplayStatus.Finished;
+            case TwinSessionStatus.Error: return ReplayStatus.Error;
+            default: return ReplayStatus.Loading;
+        }
+    }
+
+    private static TwinSessionStatus FromReplayStatus(ReplayStatus status)
+    {
+        switch (status)
+        {
+            case ReplayStatus.Ready: return TwinSessionStatus.Ready;
+            case ReplayStatus.Playing: return TwinSessionStatus.Running;
+            case ReplayStatus.Paused: return TwinSessionStatus.Paused;
+            case ReplayStatus.Finished: return TwinSessionStatus.Finished;
+            case ReplayStatus.Error: return TwinSessionStatus.Error;
+            default: return TwinSessionStatus.Connecting;
+        }
     }
 }

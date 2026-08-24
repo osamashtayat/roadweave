@@ -108,16 +108,16 @@ public class TestWeatherController : MonoBehaviour
         switch (CurrentWeather)
         {
             case TestWeatherType.Rain:
-                testVehicle.SetEnvironmentModifiers(0.75f, 0.80f, 0.75f);
+                testVehicle.SetWeatherCruisingFactor(0.90f);
                 break;
             case TestWeatherType.Snow:
-                testVehicle.SetEnvironmentModifiers(0.50f, 0.55f, 0.55f);
+                testVehicle.SetWeatherCruisingFactor(0.78f);
                 break;
             case TestWeatherType.Fog:
-                testVehicle.SetEnvironmentModifiers(0.65f, 1.00f, 0.38f);
+                testVehicle.SetWeatherCruisingFactor(0.82f);
                 break;
             default:
-                testVehicle.SetEnvironmentModifiers(1.00f, 1.00f, 1.00f);
+                testVehicle.SetWeatherCruisingFactor(1.00f);
                 break;
         }
     }

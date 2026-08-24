@@ -2,23 +2,25 @@ using UnityEngine;
 
 public class OrbitCamera : MonoBehaviour
 {
-  public float moveSpeed = 5f;
+    [Tooltip("Legacy free-camera controller. Keep disabled while VehicleFollowCamera is active.")]
+    public float moveSpeed = 5f;
     public float rotateSpeed = 80f;
+
     private void Update()
     {
-       Vector3 movement = Vector3.zero;
+        Vector3 movement = Vector3.zero;
 
         if (Input.GetKey(KeyCode.W))
-            movement -= transform.forward;   // Forward
+            movement += transform.forward;
 
         if (Input.GetKey(KeyCode.S))
-            movement += transform.forward;   // Backward
+            movement -= transform.forward;
 
         if (Input.GetKey(KeyCode.A))
-            movement += transform.right;     // Left
+            movement -= transform.right;
 
         if (Input.GetKey(KeyCode.D))
-            movement -= transform.right;     // Right
+            movement += transform.right;
 
         if (Input.GetKey(KeyCode.E))
             movement += Vector3.up;          // Up

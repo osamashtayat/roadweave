@@ -26,12 +26,13 @@ public class WheelReplayView : MonoBehaviour
     private float frontRightAngle;
     private float rearLeftAngle;
     private float rearRightAngle;
-    private float previousReplayTime;
+    private double previousSourceTime;
+    private string previousSessionId;
 
     private void Awake()
     {
         if (stateManager == null)
-            stateManager = FindFirstObjectByType<DigitalTwinStateManager>();
+            stateManager = FindAnyObjectByType<DigitalTwinStateManager>();
 
         if (frontLeftWheel != null) frontLeftStart = frontLeftWheel.localRotation;
         if (frontRightWheel != null) frontRightStart = frontRightWheel.localRotation;
@@ -41,15 +42,21 @@ public class WheelReplayView : MonoBehaviour
 
     private void LateUpdate()
     {
-        if (stateManager == null || !stateManager.IsReady)
+        if (stateManager == null || !stateManager.IsReady || !stateManager.IsFresh ||
+            (stateManager.Wheels.validity != TwinDataValidity.Valid &&
+             stateManager.Wheels.validity != TwinDataValidity.Partial))
             return;
 
-        if (stateManager.CurrentTime < previousReplayTime)
-            ResetAngles();
+        string sessionId = stateManager.Session?.sessionId;
+        double sourceTime = stateManager.CurrentSourceTimestampSeconds;
+        if (sessionId != previousSessionId || sourceTime < previousSourceTime)
+            ResetAngles(sourceTime);
 
         if (stateManager.IsPlaying)
         {
-            float seconds = Mathf.Max(0f, stateManager.CurrentTime - previousReplayTime);
+            // Subtract in double precision before converting the small delta to
+            // float. Casting Unix timestamps to float first loses sub-second time.
+            float seconds = (float)System.Math.Max(0d, sourceTime - previousSourceTime);
             frontLeftAngle += RpmToDegrees(stateManager.Wheels.frontLeftRpm, seconds) * frontLeftDirection;
             frontRightAngle += RpmToDegrees(stateManager.Wheels.frontRightRpm, seconds) * frontRightDirection;
             rearLeftAngle += RpmToDegrees(stateManager.Wheels.rearLeftRpm, seconds) * rearLeftDirection;
@@ -60,7 +67,8 @@ public class WheelReplayView : MonoBehaviour
         ApplyWheel(frontRightWheel, frontRightStart, frontRightAngle);
         ApplyWheel(rearLeftWheel, rearLeftStart, rearLeftAngle);
         ApplyWheel(rearRightWheel, rearRightStart, rearRightAngle);
-        previousReplayTime = stateManager.CurrentTime;
+        previousSourceTime = sourceTime;
+        previousSessionId = sessionId;
     }
 
     private static float RpmToDegrees(float rpm, float seconds)
@@ -72,15 +80,24 @@ public class WheelReplayView : MonoBehaviour
     {
         if (wheel == null)
             return;
+
+        // Some imported models place the mesh away from the wheel transform's
+        // pivot. Rotating that transform makes the wheel orbit out of the body.
+        // A zero axis intentionally keeps those wheels securely attached.
+        if (localRotationAxis.sqrMagnitude <= 0.0001f)
+        {
+            wheel.localRotation = startingRotation;
+            return;
+        }
         wheel.localRotation = startingRotation * Quaternion.AngleAxis(angle, localRotationAxis.normalized);
     }
 
-    private void ResetAngles()
+    private void ResetAngles(double sourceTime)
     {
         frontLeftAngle = 0f;
         frontRightAngle = 0f;
         rearLeftAngle = 0f;
         rearRightAngle = 0f;
-        previousReplayTime = 0f;
+        previousSourceTime = sourceTime;
     }
 }

@@ -1,8 +1,11 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-public class ReplayRoadGenerator : MonoBehaviour
+public class ReplayRoadGenerator : MonoBehaviour, ITestWorldRouteProvider
 {
+    public string ProviderName => "Replay road";
+    public bool IsRouteAvailable => roadPoints.Count > 1;
+
     [Header("RoadWeave Reference")]
     [SerializeField] private DigitalTwinStateManager stateManager;
 
@@ -161,6 +164,46 @@ public class ReplayRoadGenerator : MonoBehaviour
     {
         showCompleteRoadOverride = false;
         currentVisiblePointCount = -1;
+    }
+
+    public bool TryBuildTestRoute(
+        Vector3 worldStartPosition,
+        float sourceTimeSeconds,
+        float minimumPointSpacing,
+        List<Vector3> worldRoute)
+    {
+        if (worldRoute == null)
+            return false;
+
+        worldRoute.Clear();
+        worldRoute.Add(worldStartPosition);
+        float spacing = Mathf.Max(0.1f, minimumPointSpacing);
+        Vector3 lastPoint = worldStartPosition;
+
+        for (int index = 0; index < roadPoints.Count; index++)
+        {
+            if (index < roadTimes.Count && roadTimes[index] < sourceTimeSeconds)
+                continue;
+
+            Vector3 worldPoint = transform.TransformPoint(roadPoints[index]);
+            if (Vector3.Distance(lastPoint, worldPoint) < spacing)
+                continue;
+
+            worldRoute.Add(worldPoint);
+            lastPoint = worldPoint;
+        }
+
+        return worldRoute.Count > 1;
+    }
+
+    public void EnterTestMode()
+    {
+        ShowCompleteRoad();
+    }
+
+    public void ExitTestMode()
+    {
+        ResumeReplayReveal();
     }
 
     private void CollectRoadPoints(EgoReplayFrame[] frames)

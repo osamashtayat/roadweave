@@ -22,6 +22,25 @@ public class VehicleFollowCamera : MonoBehaviour
 
     private float yawOffset;
     private float pitch = 20f;
+    private Camera controlledCamera;
+
+    private void Awake()
+    {
+        controlledCamera = GetComponent<Camera>();
+        if (controlledCamera == null)
+        {
+            Debug.LogWarning("VehicleFollowCamera must be placed on the Camera it controls.", this);
+            enabled = false;
+            return;
+        }
+
+        OrbitCamera legacyOrbit = GetComponent<OrbitCamera>();
+        if (legacyOrbit != null && legacyOrbit.enabled)
+        {
+            legacyOrbit.enabled = false;
+            Debug.LogWarning("OrbitCamera was disabled because VehicleFollowCamera owns this Camera.", this);
+        }
+    }
 
     private void Start()
     {
@@ -78,6 +97,6 @@ public class VehicleFollowCamera : MonoBehaviour
     public void SetTarget(Transform newTarget)
     {
         target = newTarget;
-        enabled = target != null;
+        enabled = target != null && controlledCamera != null;
     }
 }

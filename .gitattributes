@@ -1,0 +1,22 @@
+# Keep Unity's text assets reviewable and consistent across macOS/Windows.
+*.cs text eol=lf
+*.json text eol=lf
+*.unity text eol=lf
+*.prefab text eol=lf
+*.asset text eol=lf
+*.meta text eol=lf
+
+# Imported models, textures, and recovery archives must never enter text diffs.
+*.fbx binary
+*.blend binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.tga binary
+*.psd binary
+*.zip binary
+*.7z binary
+*.rar binary
+*.tar binary
+*.tgz binary
+*.gz binary

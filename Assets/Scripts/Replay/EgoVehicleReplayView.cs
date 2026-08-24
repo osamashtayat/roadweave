@@ -10,24 +10,114 @@ public class EgoVehicleReplayView : MonoBehaviour
     [SerializeField] private bool applyPosition = true;
     [SerializeField] private bool applyRotation = true;
 
+    [Header("Streaming Presentation")]
+    [Tooltip("Replay already publishes interpolated poses. This smooths only simulated/live streams.")]
+    [SerializeField] private bool smoothStreamingSources = true;
+    [SerializeField, Min(0f)] private float positionSmoothness = 18f;
+    [SerializeField, Min(0f)] private float rotationSmoothness = 14f;
+    [Tooltip("Briefly predict forward between stream messages, then freeze until a fresh snapshot arrives.")]
+    [SerializeField, Min(0f)] private float maximumExtrapolationSeconds = 0.2f;
+
+    private Renderer[] presentationRenderers;
+    private bool[] rendererEnabledDefaults;
+    private bool presentationAvailable = true;
+    private bool streamingPoseInitialized;
+    private string presentedSessionId;
+
     private void Awake()
     {
         if (vehicleRoot == null)
             vehicleRoot = transform;
 
         if (stateManager == null)
-            stateManager = FindFirstObjectByType<DigitalTwinStateManager>();
+            stateManager = FindAnyObjectByType<DigitalTwinStateManager>();
+
+        presentationRenderers = vehicleRoot.GetComponentsInChildren<Renderer>(true);
+        rendererEnabledDefaults = new bool[presentationRenderers.Length];
+        for (int index = 0; index < presentationRenderers.Length; index++)
+            rendererEnabledDefaults[index] = presentationRenderers[index] != null && presentationRenderers[index].enabled;
     }
 
     private void LateUpdate()
     {
-        if (stateManager == null || !stateManager.IsReady)
+        bool available = stateManager != null && stateManager.IsReady && stateManager.IsFresh &&
+                         (stateManager.Ego.validity == TwinDataValidity.Valid ||
+                          stateManager.Ego.validity == TwinDataValidity.Partial);
+        SetPresentationAvailable(available);
+        if (!available)
+        {
+            streamingPoseInitialized = false;
             return;
+        }
+
+        TwinSnapshotMetadata metadata = stateManager.Metadata;
+        bool streaming = smoothStreamingSources &&
+                         metadata?.session != null &&
+                         metadata.session.sourceKind != TwinSourceKind.Replay;
+
+        Vector3 targetPosition = stateManager.Ego.position + localPositionOffset;
+        Quaternion targetRotation = Quaternion.Euler(
+            0f,
+            stateManager.Ego.yawDegrees + modelYawOffset,
+            0f);
+
+        if (streaming && metadata != null && maximumExtrapolationSeconds > 0f)
+        {
+            float age = Mathf.Clamp(
+                (float)(Time.realtimeSinceStartup - metadata.receiptTimestampSeconds),
+                0f,
+                maximumExtrapolationSeconds);
+            float distance = Mathf.Max(
+                0f,
+                stateManager.Ego.speedMetersPerSecond * age +
+                0.5f * stateManager.Ego.longitudinalAcceleration * age * age);
+            Vector3 forward = Quaternion.Euler(0f, stateManager.Ego.yawDegrees, 0f) * Vector3.forward;
+            targetPosition += forward * distance;
+        }
+
+        string sessionId = metadata?.session?.sessionId;
+        bool newSession = !string.Equals(presentedSessionId, sessionId, System.StringComparison.Ordinal);
+        if (!streaming || !streamingPoseInitialized || newSession)
+        {
+            if (applyPosition)
+                vehicleRoot.localPosition = targetPosition;
+            if (applyRotation)
+                vehicleRoot.localRotation = targetRotation;
+            streamingPoseInitialized = streaming;
+            presentedSessionId = sessionId;
+            return;
+        }
 
         if (applyPosition)
-            vehicleRoot.localPosition = stateManager.Ego.position + localPositionOffset;
+        {
+            float blend = ExponentialBlend(positionSmoothness, Time.deltaTime);
+            vehicleRoot.localPosition = Vector3.Lerp(vehicleRoot.localPosition, targetPosition, blend);
+        }
 
         if (applyRotation)
-            vehicleRoot.localRotation = Quaternion.Euler(0f, stateManager.Ego.yawDegrees + modelYawOffset, 0f);
+        {
+            float blend = ExponentialBlend(rotationSmoothness, Time.deltaTime);
+            vehicleRoot.localRotation = Quaternion.Slerp(vehicleRoot.localRotation, targetRotation, blend);
+        }
+    }
+
+    private void SetPresentationAvailable(bool available)
+    {
+        if (presentationAvailable == available)
+            return;
+        presentationAvailable = available;
+        for (int index = 0; index < presentationRenderers.Length; index++)
+        {
+            Renderer renderer = presentationRenderers[index];
+            if (renderer != null)
+                renderer.enabled = available && rendererEnabledDefaults[index];
+        }
+    }
+
+    private static float ExponentialBlend(float smoothness, float deltaTime)
+    {
+        if (smoothness <= 0f)
+            return 1f;
+        return 1f - Mathf.Exp(-smoothness * Mathf.Max(0f, deltaTime));
     }
 }

@@ -13,13 +13,18 @@ public class TestMetricsRecorder : MonoBehaviour
     private string weatherName = "Dry";
     private float elapsedTime;
     private float startingSpeedKph;
-    private Vector3 startingPosition;
+    private Vector3 lastSamplePosition;
+    private float travelledPathDistance;
     private float firstDetectionTime = -1f;
     private float firstBrakingTime = -1f;
     private float minimumObstacleDistance = float.PositiveInfinity;
     private bool collision;
     private bool destinationReached;
     private string displayStatus = "READY";
+    private int obstacleBrakingEvents;
+    private int curveSlowdownEvents;
+    private int weatherSlowdownEvents;
+    private int maneuverSlowdownEvents;
 
     private void Awake()
     {
@@ -47,6 +52,7 @@ public class TestMetricsRecorder : MonoBehaviour
             return;
 
         elapsedTime += Time.deltaTime;
+        AccumulatePathDistance(vehicle.transform.position);
         if (!float.IsInfinity(vehicle.NearestObstacleDistance))
             minimumObstacleDistance = Mathf.Min(minimumObstacleDistance, vehicle.NearestObstacleDistance);
         displayStatus = "RUNNING";
@@ -62,6 +68,7 @@ public class TestMetricsRecorder : MonoBehaviour
 
         vehicle.ObstacleDetected += OnObstacleDetected;
         vehicle.BrakingStarted += OnBrakingStarted;
+        vehicle.DecelerationStarted += OnDecelerationStarted;
         vehicle.DestinationReached += OnDestinationReached;
         vehicle.CollisionOccurred += OnCollisionOccurred;
     }
@@ -78,12 +85,17 @@ public class TestMetricsRecorder : MonoBehaviour
         weatherName = string.IsNullOrEmpty(newWeatherName) ? "Dry" : newWeatherName;
         elapsedTime = 0f;
         startingSpeedKph = vehicle.CurrentSpeedKph;
-        startingPosition = vehicle.transform.position;
+        lastSamplePosition = vehicle.transform.position;
+        travelledPathDistance = 0f;
         firstDetectionTime = -1f;
         firstBrakingTime = -1f;
         minimumObstacleDistance = float.PositiveInfinity;
         collision = false;
         destinationReached = false;
+        obstacleBrakingEvents = 0;
+        curveSlowdownEvents = 0;
+        weatherSlowdownEvents = 0;
+        maneuverSlowdownEvents = 0;
         IsRecording = true;
         displayStatus = "RUNNING";
         UpdateDisplay("RUNNING");
@@ -115,10 +127,37 @@ public class TestMetricsRecorder : MonoBehaviour
         minimumObstacleDistance = Mathf.Min(minimumObstacleDistance, distance);
     }
 
+    private void AccumulatePathDistance(Vector3 currentPosition)
+    {
+        travelledPathDistance += Vector3.Distance(lastSamplePosition, currentPosition);
+        lastSamplePosition = currentPosition;
+    }
+
     private void OnBrakingStarted()
     {
-        if (IsRecording && firstBrakingTime < 0f)
+        if (!IsRecording)
+            return;
+        obstacleBrakingEvents++;
+        if (firstBrakingTime < 0f)
             firstBrakingTime = elapsedTime;
+    }
+
+    private void OnDecelerationStarted(VehicleDecelerationReason reason)
+    {
+        if (!IsRecording)
+            return;
+        switch (reason)
+        {
+            case VehicleDecelerationReason.Curve:
+                curveSlowdownEvents++;
+                break;
+            case VehicleDecelerationReason.Weather:
+                weatherSlowdownEvents++;
+                break;
+            case VehicleDecelerationReason.Maneuver:
+                maneuverSlowdownEvents++;
+                break;
+        }
     }
 
     private void OnDestinationReached()
@@ -142,7 +181,6 @@ public class TestMetricsRecorder : MonoBehaviour
         if (resultsText == null || vehicle == null)
             return;
 
-        float travelledDistance = Vector3.Distance(startingPosition, vehicle.transform.position);
         string detection = firstDetectionTime < 0f ? "Not detected" : $"{firstDetectionTime:F2} s";
         string braking = firstBrakingTime < 0f ? "Not started" : $"{firstBrakingTime:F2} s";
         string reaction = firstDetectionTime >= 0f && firstBrakingTime >= firstDetectionTime
@@ -161,10 +199,13 @@ public class TestMetricsRecorder : MonoBehaviour
             $"Elapsed Time: {elapsedTime:F2} s\n" +
             $"Starting Speed: {startingSpeedKph:F1} km/h\n" +
             $"Current Speed: {vehicle.CurrentSpeedKph:F1} km/h\n" +
-            $"Distance Travelled: {travelledDistance:F1} m\n" +
+            $"Distance Travelled (path): {travelledPathDistance:F1} m\n" +
             $"First Detection: {detection}\n" +
-            $"First Braking: {braking}\n" +
+            $"First Obstacle Braking: {braking}\n" +
             $"Reaction Time: {reaction}\n" +
+            $"Current Slowdown Reason: {vehicle.CurrentDecelerationReason}\n" +
+            $"Slowdown Events: obstacle {obstacleBrakingEvents}, curve {curveSlowdownEvents}, " +
+            $"weather {weatherSlowdownEvents}, maneuver {maneuverSlowdownEvents}\n" +
             $"Minimum Obstacle Distance: {minimumDistance}\n" +
             $"Collision: {(collision ? "Yes" : "No")}\n" +
             $"Destination Reached: {(destinationReached ? "Yes" : "No")}";
@@ -198,6 +239,7 @@ public class TestMetricsRecorder : MonoBehaviour
             return;
         vehicle.ObstacleDetected -= OnObstacleDetected;
         vehicle.BrakingStarted -= OnBrakingStarted;
+        vehicle.DecelerationStarted -= OnDecelerationStarted;
         vehicle.DestinationReached -= OnDestinationReached;
         vehicle.CollisionOccurred -= OnCollisionOccurred;
     }

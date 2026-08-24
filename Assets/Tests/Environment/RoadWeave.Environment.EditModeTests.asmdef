@@ -1,0 +1,5 @@
+{
+  "name": "RoadWeave.Environment.EditModeTests",
+  "includePlatforms": ["Editor"],
+  "optionalUnityReferences": ["TestAssemblies"]
+}

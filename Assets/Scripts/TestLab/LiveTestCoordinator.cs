@@ -8,6 +8,11 @@ public class LiveTestCoordinator : MonoBehaviour
     [SerializeField] private DigitalTwinStateManager stateManager;
     [SerializeField] private NuScenesReplayController replayController;
     [SerializeField] private ReplayRoadGenerator roadGenerator;
+    [SerializeField] private ReplayActorManager replayActorManager;
+    [Tooltip("Legacy replay route-provider fallback. ReplayRoadGenerator is preferred.")]
+    [SerializeField] private MonoBehaviour routeProviderComponent;
+    [Tooltip("Route provider used by simulated and live-stream sources.")]
+    [SerializeField] private MonoBehaviour streamingRouteProviderComponent;
     [SerializeField] private Transform replayRoot;
     [SerializeField] private Transform liveVehicleRoot;
 
@@ -17,8 +22,6 @@ public class LiveTestCoordinator : MonoBehaviour
     [SerializeField] private GameObject testVehiclePrefab;
     [SerializeField] private float testVehicleModelYawOffset;
     [SerializeField, Min(0.25f)] private float routePointSpacing = 1f;
-    [SerializeField, Min(25f)] private float testRouteContinuationLength = 250f;
-    [SerializeField, Min(0.5f)] private float testRouteContinuationSpacing = 2f;
     [SerializeField] private TestScenarioManager scenarioManager;
     [SerializeField] private TestWeatherController weatherController;
     [SerializeField] private TestMetricsRecorder metricsRecorder;
@@ -33,17 +36,35 @@ public class LiveTestCoordinator : MonoBehaviour
     public AutonomousTestVehicleController TestVehicle { get; private set; }
     public bool IsInTestLab { get; private set; }
 
-    private float capturedReplayTime;
+    private float capturedSourceTime;
     private float capturedSpeedKph;
     private Vector3 capturedPosition;
     private Quaternion capturedRotation;
+    private bool sourceWasRunningBeforeTest;
+    private bool sourceWasPausedByTest;
+    private bool replayActorsWereVisible = true;
+    private ITestWorldRouteProvider activeRouteProvider;
 
     private void Awake()
     {
         if (stateManager == null) stateManager = FindFirstObjectByType<DigitalTwinStateManager>();
         if (replayController == null) replayController = FindFirstObjectByType<NuScenesReplayController>();
         if (roadGenerator == null) roadGenerator = FindFirstObjectByType<ReplayRoadGenerator>();
+        if (replayActorManager == null) replayActorManager = FindFirstObjectByType<ReplayActorManager>();
+        if (streamingRouteProviderComponent == null)
+            streamingRouteProviderComponent = FindAnyObjectByType<StreamingRouteProvider>();
         if (followCamera == null) followCamera = FindFirstObjectByType<VehicleFollowCamera>();
+
+        if (routeProviderComponent != null && !(routeProviderComponent is ITestWorldRouteProvider))
+        {
+            Debug.LogError("LiveTestCoordinator Replay Route Provider does not implement ITestWorldRouteProvider.");
+        }
+
+        if (streamingRouteProviderComponent != null &&
+            !(streamingRouteProviderComponent is ITestWorldRouteProvider))
+        {
+            Debug.LogError("LiveTestCoordinator Streaming Route Provider does not implement ITestWorldRouteProvider.");
+        }
 
         if (replayRoot == null && liveVehicleRoot != null)
             replayRoot = liveVehicleRoot.parent;
@@ -65,16 +86,17 @@ public class LiveTestCoordinator : MonoBehaviour
     {
         if (stateManager == null || !stateManager.IsReady || liveVehicleRoot == null)
         {
-            Debug.LogWarning("LiveTestCoordinator cannot create a test until the replay and live vehicle are ready.");
+            Debug.LogWarning("LiveTestCoordinator cannot create a test until the digital-twin state and vehicle are ready.");
             return;
         }
 
-        bool replayWasMoving = stateManager.IsPlaying;
-        replayController?.PauseReplay();
-        capturedReplayTime = stateManager.CurrentTime;
+        sourceWasRunningBeforeTest = stateManager.IsPlaying;
+        replayActorsWereVisible = replayActorManager == null || replayActorManager.RuntimeActorsVisible;
+        PauseActiveSourceIfSupported();
+        capturedSourceTime = stateManager.CurrentTime;
         // If Create Test is pressed before Drive, begin the autonomous test from
         // rest instead of inheriting a non-zero speed stored in the first frame.
-        capturedSpeedKph = replayWasMoving
+        capturedSpeedKph = sourceWasRunningBeforeTest
             ? stateManager.Vehicle.speedKilometersPerHour
             : 0f;
         capturedPosition = liveVehicleRoot.position;
@@ -130,19 +152,31 @@ public class LiveTestCoordinator : MonoBehaviour
 
         if (testWorldRoot != null) testWorldRoot.gameObject.SetActive(false);
         if (liveVehicleRoot != null) liveVehicleRoot.gameObject.SetActive(true);
-        if (roadGenerator != null) roadGenerator.ResumeReplayReveal();
+        if (replayActorManager != null)
+            replayActorManager.SetRuntimeActorsVisible(replayActorsWereVisible);
+        activeRouteProvider?.ExitTestMode();
+        activeRouteProvider = null;
         if (followCamera != null && liveVehicleRoot != null) followCamera.SetTarget(liveVehicleRoot);
         if (liveTwinPanel != null) liveTwinPanel.SetActive(true);
         if (testLabPanel != null) testLabPanel.SetActive(false);
 
         IsInTestLab = false;
         UpdateModeLabel("LIVE TWIN");
-        if (resumeReplayWhenReturning)
-            replayController?.StartDrive();
+        ResumeActiveSourceIfNeeded();
     }
 
     private void BuildTestFromCapturedState()
     {
+        if (!TryBuildRemainingWorldRoute(out List<Vector3> route, out string routeFailure))
+        {
+            Debug.LogError(routeFailure);
+            UpdateModeLabel("TEST LAB — ROUTE UNAVAILABLE");
+            activeRouteProvider = null;
+            if (!IsInTestLab)
+                ResumeActiveSourceIfNeeded();
+            return;
+        }
+
         if (TestVehicle != null)
             TestVehicle.SetRunning(false);
 
@@ -154,7 +188,8 @@ public class LiveTestCoordinator : MonoBehaviour
         if (testWorldRoot != null)
             testWorldRoot.gameObject.SetActive(true);
 
-        List<Vector3> route = BuildRemainingWorldRoute();
+        replayActorManager?.SetRuntimeActorsVisible(false);
+        activeRouteProvider?.EnterTestMode();
         Vector3 testStartPosition = route.Count > 0 ? route[0] : capturedPosition;
         GameObject source = testVehiclePrefab != null ? testVehiclePrefab : liveVehicleRoot.gameObject;
         GameObject testVehicleObject = Instantiate(
@@ -184,7 +219,6 @@ public class LiveTestCoordinator : MonoBehaviour
         TestVehicle.SetRunning(false);
 
         if (liveVehicleRoot != null) liveVehicleRoot.gameObject.SetActive(false);
-        if (roadGenerator != null) roadGenerator.ShowCompleteRoad();
         if (scenarioManager != null) scenarioManager.SetTestVehicle(TestVehicle);
         if (weatherController != null) weatherController.SetTestVehicle(TestVehicle);
         if (metricsRecorder != null) metricsRecorder.AttachVehicle(TestVehicle);
@@ -196,75 +230,78 @@ public class LiveTestCoordinator : MonoBehaviour
         UpdateModeLabel("TEST LAB — READY");
     }
 
-    private List<Vector3> BuildRemainingWorldRoute()
+    private bool TryBuildRemainingWorldRoute(out List<Vector3> route, out string failure)
     {
-        List<Vector3> route = new List<Vector3> { capturedPosition };
-        if (stateManager.Package == null || stateManager.Package.egoFrames == null)
-            return route;
+        route = new List<Vector3>();
+        failure = null;
+        activeRouteProvider = ResolveRouteProvider(out failure);
+        if (activeRouteProvider == null)
+            return false;
 
-        Vector3 lastPoint = capturedPosition;
-        foreach (EgoReplayFrame frame in stateManager.Package.egoFrames)
+        if (!activeRouteProvider.IsRouteAvailable)
         {
-            if (frame.time < capturedReplayTime)
-                continue;
-
-            Vector3 localPoint = frame.position.ToVector3();
-            Vector3 worldPoint = replayRoot != null ? replayRoot.TransformPoint(localPoint) : localPoint;
-            if (Vector3.Distance(lastPoint, worldPoint) < routePointSpacing)
-                continue;
-
-            route.Add(worldPoint);
-            lastPoint = worldPoint;
+            failure = $"Create Test cannot start: {activeRouteProvider.ProviderName} has no usable route yet.";
+            return false;
         }
 
-        EgoReplayFrame[] frames = stateManager.Package.egoFrames;
-        if (frames.Length > 0)
+        if (!activeRouteProvider.TryBuildTestRoute(
+                capturedPosition,
+                capturedSourceTime,
+                routePointSpacing,
+                route) || route.Count < 2)
         {
-            Vector3 lastLocal = frames[frames.Length - 1].position.ToVector3();
-            Vector3 finalPoint = replayRoot != null ? replayRoot.TransformPoint(lastLocal) : lastLocal;
-            if (Vector3.Distance(lastPoint, finalPoint) > 0.1f)
-                route.Add(finalPoint);
+            failure = $"Create Test cannot start: {activeRouteProvider.ProviderName} could not provide at least two forward route points.";
+            return false;
         }
 
-        AppendTestRouteContinuation(route, frames);
-
-        if (route.Count < 2)
-            Debug.LogWarning("Create Test could not build a usable autonomous route.");
-
-        return route;
+        return true;
     }
 
-    private void AppendTestRouteContinuation(List<Vector3> route, EgoReplayFrame[] frames)
+    private ITestWorldRouteProvider ResolveRouteProvider(out string failure)
     {
-        if (route == null || route.Count == 0 || testRouteContinuationLength <= 0f)
-            return;
+        TwinSourceKind sourceKind = stateManager?.Session?.sourceKind ?? TwinSourceKind.Unknown;
+        return ResolveRouteProviderForSource(sourceKind, out failure);
+    }
 
-        Vector3 direction = Vector3.zero;
-        if (route.Count >= 2)
+    private ITestWorldRouteProvider ResolveRouteProviderForSource(
+        TwinSourceKind sourceKind,
+        out string failure)
+    {
+        MonoBehaviour providerComponent;
+        string expectedProvider;
+        switch (sourceKind)
         {
-            direction = route[route.Count - 1] - route[route.Count - 2];
-        }
-        else if (frames != null && frames.Length >= 2)
-        {
-            Vector3 previousLocal = frames[frames.Length - 2].position.ToVector3();
-            Vector3 finalLocal = frames[frames.Length - 1].position.ToVector3();
-            Vector3 previousWorld = replayRoot != null ? replayRoot.TransformPoint(previousLocal) : previousLocal;
-            Vector3 finalWorld = replayRoot != null ? replayRoot.TransformPoint(finalLocal) : finalLocal;
-            direction = finalWorld - previousWorld;
+            case TwinSourceKind.Replay:
+                providerComponent = roadGenerator != null
+                    ? roadGenerator
+                    : routeProviderComponent;
+                expectedProvider = "ReplayRoadGenerator";
+                break;
+            case TwinSourceKind.SimulatedStream:
+            case TwinSourceKind.LiveSensor:
+                providerComponent = streamingRouteProviderComponent;
+                expectedProvider = "StreamingRouteProvider";
+                break;
+            default:
+                failure = $"Create Test cannot start: source kind '{sourceKind}' does not identify a route provider.";
+                return null;
         }
 
-        direction.y = 0f;
-        if (direction.sqrMagnitude <= 0.001f)
-            return;
-        direction.Normalize();
-
-        Vector3 startingPoint = route[route.Count - 1];
-        int stepCount = Mathf.CeilToInt(testRouteContinuationLength / testRouteContinuationSpacing);
-        for (int step = 1; step <= stepCount; step++)
+        if (providerComponent == null)
         {
-            float distance = Mathf.Min(step * testRouteContinuationSpacing, testRouteContinuationLength);
-            route.Add(startingPoint + direction * distance);
+            failure = $"Create Test cannot start: source kind '{sourceKind}' requires {expectedProvider}, but none is assigned.";
+            return null;
         }
+
+        ITestWorldRouteProvider provider = providerComponent as ITestWorldRouteProvider;
+        if (provider != null)
+        {
+            failure = null;
+            return provider;
+        }
+
+        failure = $"Create Test cannot start: '{providerComponent.name}' is not a compatible {expectedProvider}.";
+        return null;
     }
 
     private void ClearTestVehicle()
@@ -278,12 +315,62 @@ public class LiveTestCoordinator : MonoBehaviour
     {
         if (testWorldRoot != null) testWorldRoot.gameObject.SetActive(false);
         if (liveVehicleRoot != null) liveVehicleRoot.gameObject.SetActive(true);
+        replayActorManager?.SetRuntimeActorsVisible(true);
         if (liveTwinPanel != null) liveTwinPanel.SetActive(true);
         if (testLabPanel != null) testLabPanel.SetActive(false);
         if (followCamera != null && liveVehicleRoot != null) followCamera.SetTarget(liveVehicleRoot);
         IsInTestLab = false;
         UpdateModeLabel("LIVE TWIN");
         if (resumeReplay) replayController?.StartDrive();
+    }
+
+    private void PauseActiveSourceIfSupported()
+    {
+        sourceWasPausedByTest = false;
+        if (!sourceWasRunningBeforeTest || stateManager == null)
+            return;
+
+        bool supportsPause = (stateManager.Session.capabilities & TwinSourceCapabilities.Pause) != 0;
+        ITwinSessionControl sessionControl = stateManager.SessionControl;
+        if (supportsPause && sessionControl != null)
+        {
+            sessionControl.PauseSession();
+            sourceWasPausedByTest = true;
+            return;
+        }
+
+        if (stateManager.Session.sourceKind == TwinSourceKind.Replay && replayController != null)
+        {
+            replayController.PauseReplay();
+            sourceWasPausedByTest = true;
+        }
+    }
+
+    private void ResumeActiveSourceIfNeeded()
+    {
+        if (!resumeReplayWhenReturning || !sourceWasRunningBeforeTest || !sourceWasPausedByTest)
+            return;
+
+        ITwinSessionControl sessionControl = stateManager != null ? stateManager.SessionControl : null;
+        if (sessionControl != null)
+            sessionControl.StartSession();
+        else
+            replayController?.StartDrive();
+        sourceWasPausedByTest = false;
+    }
+
+    private void OnDisable()
+    {
+        if (!IsInTestLab)
+            return;
+
+        if (liveVehicleRoot != null)
+            liveVehicleRoot.gameObject.SetActive(true);
+        if (testWorldRoot != null)
+            testWorldRoot.gameObject.SetActive(false);
+        if (replayActorManager != null)
+            replayActorManager.SetRuntimeActorsVisible(replayActorsWereVisible);
+        activeRouteProvider?.ExitTestMode();
     }
 
     private void UpdateModeLabel(string message)

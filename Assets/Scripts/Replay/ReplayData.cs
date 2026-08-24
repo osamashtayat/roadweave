@@ -89,38 +89,6 @@ public class ActorReplayFrame
     public string visibility;
 }
 
-public class TwinEgoState
-{
-    public Vector3 position;
-    public float yawDegrees;
-    public float speedMetersPerSecond;
-    public float longitudinalAcceleration;
-}
-
-public class TwinVehicleState
-{
-    public float speedKilometersPerHour;
-    public float batteryPercent;
-    public float availableDistanceKilometers;
-    public int gearPosition;
-    public float throttlePercent;
-    public float brake;
-    public int brakeSwitch;
-    public float steeringDegrees;
-    public float steeringSpeed;
-    public float yawRate;
-    public int leftSignal;
-    public int rightSignal;
-}
-
-public class TwinWheelState
-{
-    public float frontLeftRpm;
-    public float frontRightRpm;
-    public float rearLeftRpm;
-    public float rearRightRpm;
-}
-
 public enum ReplayStatus
 {
     Loading,
