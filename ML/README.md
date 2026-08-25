@@ -160,6 +160,7 @@ publishing this baseline.
 - `src/train_model.py`: group-separated fitting, evaluation, artifacts, and reports
 - `src/test_prediction.py`: explains one saved-model prediction
 - `src/online_policy.py`: 5 Hz learned policy plus deterministic safety wrapper
+- `Tools/benchmark_controllers.py`: rule-vs-ML safety/comfort comparison
 - `tests/`: feature, splitting, safety, and runtime unit tests
 
 ## Transition to a future sensor gateway

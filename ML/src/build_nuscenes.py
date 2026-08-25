@@ -3,10 +3,11 @@
 
 The converter produces two Parquet files:
 
-* ``risk_nuscenes.parquet`` contains only conservatively filtered LOW-risk
-  windows.  K-Risk supplies the MODERATE/HIGH/EXTREME rows later.
+* ``risk_nuscenes.parquet`` contains LOW/MODERATE/HIGH/EXTREME windows graded
+  by physical severity, so nuScenes is not a pure "safe" source shortcut.
 * ``policy_nuscenes.parquet`` contains routine driving-policy examples whose
-  target is derived from ego motion one second after the observation time.
+  target is derived from ego motion up to three seconds after the observation
+  time (lateral motion is integrated per-frame to stay curvature-invariant).
 
 Every input row summarizes exactly the current and previous three seconds.
 The future ego pose is used only to construct the policy target and is never
@@ -632,21 +633,42 @@ def _future_index(
     return future_index
 
 
-def _policy_target(current: EgoFrame, future: EgoFrame) -> str:
-    """Derive a five-class action from future ego motion.
+def _future_lateral_displacement(
+    frames: Sequence[Optional[EgoFrame]],
+    index: int,
+    future_index: int,
+) -> float:
+    """Integrate lateral motion over the future window, per frame heading.
 
-    Only this function sees the future frame.  Its output is a label string;
-    no future measurement enters the feature dictionary.
+    Projecting the total future displacement onto the current heading would
+    mistake road curvature for a lane change. Integrating each inter-frame
+    displacement onto that frame's own heading removes the curvature signal and
+    leaves the actual cross-lane motion, which is what a lane change produces.
     """
 
-    relative_future_position = np.asarray(
-        current.global_orientation.inverse.rotate(
-            future.global_position - current.global_position
-        ),
-        dtype=np.float64,
-    )
-    lateral_displacement = float(relative_future_position[1])
-    speed_change = future.speed - current.speed
+    current = frames[index]
+    total = 0.0
+    previous = current
+    for later_index in range(index + 1, future_index + 1):
+        frame = frames[later_index]
+        if frame is None:
+            continue
+        displacement = frame.global_position - previous.global_position
+        lateral = float(previous.global_orientation.inverse.rotate(displacement)[1])
+        total += lateral
+        previous = frame
+    return total
+
+
+def _policy_target(
+    speed_change: float,
+    lateral_displacement: float,
+) -> str:
+    """Derive a five-class action from future ego motion.
+
+    Only this function sees future frames. Its output is a label string; no
+    future measurement enters the feature dictionary.
+    """
 
     if lateral_displacement > 1.4:
         action = DrivingAction.CHANGE_LEFT
@@ -673,36 +695,53 @@ def _minimum_present_value(
     return min(values) if values else None
 
 
-def _is_conservatively_low_risk(
+def _risk_level(
     history_states: Sequence[Mapping[str, float]],
     history_frames: Sequence[EgoFrame],
-) -> bool:
-    """Select only clearly routine nuScenes windows for the LOW class."""
+) -> str:
+    """Grade one nuScenes window by physical severity.
+
+    nuScenes has no K-Risk driver-risk field, so severity is derived from the
+    same physical signals the model is allowed to see: ego acceleration, front
+    time-to-collision, pedestrian proximity, and physical overlap. Emitting
+    non-LOW rows from nuScenes breaks the "LOW always means nuScenes" shortcut
+    that otherwise lets the risk model learn dataset identity instead of risk.
+    """
 
     if any(frame.has_overlap for frame in history_frames):
-        return False
+        return RISK_NAMES[RiskLevel.EXTREME]
 
     accelerations = [
         abs(float(state["ego_accel"]))
         for state in history_states
         if _finite(state.get("ego_accel"))
     ]
-    if not accelerations or max(accelerations) >= 2.5:
-        return False
+    max_abs_accel = max(accelerations) if accelerations else 0.0
 
     minimum_front_ttc = _minimum_present_value(history_states, "front_ttc")
-    if minimum_front_ttc is not None and minimum_front_ttc <= 5.0:
-        return False
+    minimum_pedestrian_gap = _minimum_present_value(history_states, "pedestrian_gap")
 
-    minimum_pedestrian_gap = _minimum_present_value(
-        history_states,
-        "pedestrian_gap",
-    )
+    if minimum_front_ttc is not None and minimum_front_ttc <= 1.5:
+        return RISK_NAMES[RiskLevel.EXTREME]
+    if minimum_pedestrian_gap is not None and minimum_pedestrian_gap <= 3.0:
+        return RISK_NAMES[RiskLevel.EXTREME]
+
+    if max_abs_accel >= 4.0:
+        return RISK_NAMES[RiskLevel.HIGH]
+    if minimum_front_ttc is not None and minimum_front_ttc <= 3.0:
+        return RISK_NAMES[RiskLevel.HIGH]
+    if minimum_pedestrian_gap is not None and minimum_pedestrian_gap <= 8.0:
+        return RISK_NAMES[RiskLevel.HIGH]
+
+    if max_abs_accel >= 2.5:
+        return RISK_NAMES[RiskLevel.MODERATE]
+    if minimum_front_ttc is not None and minimum_front_ttc <= 5.0:
+        return RISK_NAMES[RiskLevel.MODERATE]
     if minimum_pedestrian_gap is not None and minimum_pedestrian_gap <= 15.0:
-        return False
+        return RISK_NAMES[RiskLevel.MODERATE]
 
     # A present actor with unknown TTC is not confidently LOW-risk when it is
-    # already close.  Keep uncertainty out of the low-risk reference set.
+    # already close. Keep uncertainty out of the low-risk reference set.
     for state in history_states:
         if (
             state.get("front_present", 0.0) >= 0.5
@@ -710,9 +749,9 @@ def _is_conservatively_low_risk(
             and float(state["front_gap"]) < 20.0
             and not _finite(state.get("front_ttc"))
         ):
-            return False
+            return RISK_NAMES[RiskLevel.MODERATE]
 
-    return True
+    return RISK_NAMES[RiskLevel.LOW]
 
 
 def _output_row(
@@ -820,15 +859,14 @@ def _process_scene(
         ]
         features = summarize_history(history_states)
 
-        if _is_conservatively_low_risk(history_states, history_frames):
-            risk_rows.append(
-                _output_row(
-                    scene_name,
-                    current.timestamp_seconds,
-                    RISK_NAMES[RiskLevel.LOW],
-                    features,
-                )
+        risk_rows.append(
+            _output_row(
+                scene_name,
+                current.timestamp_seconds,
+                _risk_level(history_states, history_frames),
+                features,
             )
+        )
 
         future_index = _future_index(
             frames,
@@ -846,7 +884,28 @@ def _process_scene(
             statistics.windows_without_future += 1
             continue
 
-        target = _policy_target(current, future)
+        lateral_displacement = _future_lateral_displacement(
+            frames,
+            index,
+            future_index,
+        )
+
+        # Speed change uses a shorter 1 s horizon so longitudinal labels stay
+        # sharp; only the lateral (lane-change) signal integrates over the
+        # longer future_seconds window.
+        speed_index = _future_index(
+            frames,
+            relative_timestamps,
+            index,
+            1.0,
+            timestamp_tolerance_seconds,
+        )
+        speed_future = frames[speed_index] if speed_index is not None else None
+        if speed_future is None:
+            speed_future = future
+        speed_change = speed_future.speed - current.speed
+
+        target = _policy_target(speed_change, lateral_displacement)
         policy_rows.append(
             _output_row(
                 scene_name,
@@ -971,7 +1030,7 @@ def _parse_arguments() -> argparse.Namespace:
         help="Process at most N selected scenes (use 1 for a smoke test).",
     )
     parser.add_argument("--history-seconds", type=float, default=3.0)
-    parser.add_argument("--future-seconds", type=float, default=1.0)
+    parser.add_argument("--future-seconds", type=float, default=3.0)
     parser.add_argument(
         "--timestamp-tolerance-seconds",
         type=float,
@@ -1134,7 +1193,7 @@ def main() -> None:
     if arguments.validate:
         risk_validation = _validate_output(
             arguments.risk_output,
-            [RISK_NAMES[RiskLevel.LOW]],
+            list(RISK_NAMES.values()),
             "nuscenes",
         )
         policy_validation = _validate_output(

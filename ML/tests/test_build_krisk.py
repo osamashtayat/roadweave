@@ -8,6 +8,7 @@ from pathlib import Path
 from ML.src.build_krisk import (
     canonical_response_stem,
     convert_event,
+    flatten_records,
     longitudinal_gap,
     normalized_id,
     parse_event_identity,
@@ -53,6 +54,34 @@ class KRiskConverterTests(unittest.TestCase):
             ),
             ("freewayB", "895", 4419, 4510),
         )
+
+    def test_levelx_identity_accepts_negative_frames(self):
+        self.assertEqual(
+            parse_event_identity(
+                "recording_18_ego_3_frame_-40_to_35", "ind"
+            ),
+            ("ind", "3", -40, 35),
+        )
+
+    def test_ind_nested_frame_list_is_flattened(self):
+        payload = [
+            {
+                "frame_id": 10,
+                "vehicles": [
+                    {"trackId": 3.0, "xCenter": 1.0, "yCenter": 2.0},
+                    {"trackId": 8.0, "xCenter": 5.0, "yCenter": 6.0},
+                ],
+            },
+            {
+                "frame_id": 11,
+                "vehicles": [{"trackId": 3.0, "xCenter": 1.5, "yCenter": 2.5}],
+            },
+        ]
+        records = flatten_records(payload, "ind")
+        self.assertEqual(len(records), 3)
+        self.assertEqual(records[0]["frame_id"], 10)
+        self.assertEqual(records[0]["trackId"], 3.0)
+        self.assertEqual(records[2]["frame_id"], 11)
 
     def test_gpt_action_parser_accepts_markdown_hashes(self):
         with tempfile.TemporaryDirectory() as directory:

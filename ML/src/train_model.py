@@ -208,6 +208,59 @@ def _domain_metrics(
     return result
 
 
+def leave_one_source_out(
+    data: pd.DataFrame,
+    feature_columns: Sequence[str],
+    labels: Sequence[str],
+    task: str,
+    seed: int,
+    krisk_policy_weight: float,
+) -> Dict[str, Any]:
+    """Train on every source except one, then evaluate on the held-out source.
+
+    A source-confounded model scores well on a random group split because the
+    test rows look like the training rows. Leave-one-source-out instead exposes
+    whether the learned cue actually transfers across domains.
+    """
+
+    results: Dict[str, Any] = {}
+    sources = sorted(data["source"].astype(str).unique())
+    for held_out_source in sources:
+        train = data[data["source"].astype(str) != held_out_source]
+        test = data[data["source"].astype(str) == held_out_source]
+        if train.empty or test.empty:
+            continue
+
+        model = HistGradientBoostingClassifier(
+            learning_rate=0.05,
+            max_iter=350,
+            max_leaf_nodes=31,
+            min_samples_leaf=20,
+            l2_regularization=1.0,
+            class_weight="balanced",
+            early_stopping=False,
+            random_state=seed,
+        )
+        x_train = clean_feature_frame(train, feature_columns)
+        y_train = train["target"].astype(str)
+        sample_weight = np.ones(len(train), dtype=np.float64)
+        if task == "policy":
+            krisk_rows = train["source"].astype(str).eq("krisk").to_numpy()
+            sample_weight[krisk_rows] = max(1.0, krisk_policy_weight)
+        model.fit(x_train, y_train, sample_weight=sample_weight)
+
+        metrics, _ = _evaluate(model, test, feature_columns, labels)
+        results[str(held_out_source)] = {
+            "trained_on": [s for s in sources if s != held_out_source],
+            "rows": metrics["rows"],
+            "accuracy": metrics["accuracy"],
+            "balanced_accuracy": metrics["balanced_accuracy"],
+            "macro_f1": metrics["macro_f1"],
+            "weighted_f1": metrics["weighted_f1"],
+        }
+    return results
+
+
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train one RoadWeave HistGradientBoosting baseline model."
@@ -307,6 +360,15 @@ def main() -> int:
         model, test, feature_columns, labels
     )
 
+    leave_one_out = leave_one_source_out(
+        data,
+        feature_columns,
+        labels,
+        task,
+        arguments.seed,
+        arguments.krisk_policy_weight,
+    )
+
     importance_sample_size = max(1, arguments.importance_sample_size)
     importance_sample = test
     if len(test) > importance_sample_size:
@@ -402,6 +464,7 @@ def main() -> int:
         "test_by_source": _domain_metrics(
             model, test, feature_columns, labels
         ),
+        "leave_one_source_out": leave_one_out,
         "important_features": important_features,
         "model_path": str(model_path),
         "predictions_path": str(predictions_path),
@@ -410,6 +473,14 @@ def main() -> int:
 
     print("Validation macro F1: {:.4f}".format(validation_metrics["macro_f1"]))
     print("Test macro F1: {:.4f}".format(test_metrics["macro_f1"]))
+    for source, lodo in leave_one_out.items():
+        print(
+            "Leave-one-source-out {}: macro F1 {:.4f} | accuracy {:.4f}".format(
+                source,
+                lodo["macro_f1"],
+                lodo["accuracy"],
+            )
+        )
     print("Model: {}".format(model_path))
     print("Metrics: {}".format(report_path))
     print("Predictions: {}".format(predictions_path))

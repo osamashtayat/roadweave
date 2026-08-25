@@ -37,7 +37,7 @@ if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 
 from features import new_state, set_slot, summarize_history  # noqa: E402
-from labels import ACTION_NAMES, KRISK_ACTION_MAP  # noqa: E402
+from labels import ACTION_NAMES, KRISK_ACTION_MAP, DrivingAction  # noqa: E402
 
 
 DEFAULT_DATA_ROOT = Path("/Users/asus/Downloads/32896772/K-Risk_data")
@@ -56,6 +56,11 @@ HIGHD_EGO_PATTERN = re.compile(
 CITYSIM_EGO_PATTERN = re.compile(
     r"^(?P<source>expresswayA|freewayB)_track_(?P<track>\d+)_"
     r"car_(?P<ego>\d+)_frame_(?P<start>\d+)_to_(?P<end>\d+)$",
+    re.IGNORECASE,
+)
+LEVELX_EGO_PATTERN = re.compile(
+    r"^recording_(?P<recording>\d+)_ego_(?P<ego>\d+)_frame_"
+    r"(?P<start>-?\d+)_to_(?P<end>-?\d+)$",
     re.IGNORECASE,
 )
 
@@ -81,6 +86,8 @@ SOURCE_FPS = {
     "highd": 25.0,
     "expresswaya": 30.0,
     "freewayb": 30.0,
+    "ind": 25.0,
+    "round": 25.0,
 }
 
 FORBIDDEN_FEATURE_FRAGMENTS = (
@@ -254,6 +261,34 @@ def event_directories(data_root: Path) -> Sequence[Tuple[str, str, str, Path, in
             hv_root / "freewayB" / "freewayB_high_risk",
             0,
         ),
+        (
+            "ind",
+            "ind",
+            "MODERATE",
+            hv_root / "ind" / "ind_normal_risk",
+            0,
+        ),
+        (
+            "ind",
+            "ind",
+            "HIGH",
+            hv_root / "ind" / "ind_high_risk",
+            0,
+        ),
+        (
+            "round",
+            "round",
+            "MODERATE",
+            hv_root / "round" / "round_normal_risk",
+            0,
+        ),
+        (
+            "round",
+            "round",
+            "HIGH",
+            hv_root / "round" / "round_high_risk",
+            0,
+        ),
         # ttc_1s wins a same-severity tie with ttc_2s.
         (
             "extreme_ttc_2s",
@@ -314,12 +349,22 @@ def discover_events(data_root: Path) -> Tuple[List[Dict[str, object]], Dict[str,
 
 
 def parse_event_identity(stem: str, schema: str) -> Tuple[str, str, int, int]:
-    pattern = HIGHD_EGO_PATTERN if schema == "highd" else CITYSIM_EGO_PATTERN
+    if schema == "highd":
+        pattern = HIGHD_EGO_PATTERN
+    elif schema == "citysim":
+        pattern = CITYSIM_EGO_PATTERN
+    else:
+        pattern = LEVELX_EGO_PATTERN
     match = pattern.match(stem)
     if match is None:
         raise ConversionError("Unrecognized {0} filename: {1}".format(schema, stem))
 
-    source = "highd" if schema == "highd" else match.group("source")
+    if schema == "highd":
+        source = "highd"
+    elif schema == "citysim":
+        source = match.group("source")
+    else:
+        source = schema
     return (
         source,
         match.group("ego"),
@@ -328,10 +373,37 @@ def parse_event_identity(stem: str, schema: str) -> Tuple[str, str, int, int]:
     )
 
 
+def _flatten_nested_frames(
+    frames: Iterable[object],
+    schema: str,
+) -> List[Dict[str, object]]:
+    frame_key = "frame" if schema == "highd" else "frame_id"
+    flattened: List[Dict[str, object]] = []
+    for frame in frames:
+        if not isinstance(frame, dict):
+            continue
+        frame_id = frame.get("frame_id", frame.get("frame"))
+        vehicles = frame.get("vehicles", [])
+        if not isinstance(vehicles, list):
+            continue
+        for vehicle in vehicles:
+            if not isinstance(vehicle, dict):
+                continue
+            record = dict(vehicle)
+            record.setdefault(frame_key, frame_id)
+            flattened.append(record)
+    return flattened
+
+
 def flatten_records(payload: object, schema: str) -> List[Dict[str, object]]:
-    """Accept released flat lists and the documented nested frames shape."""
+    """Accept flat vehicle lists and both documented nested frame shapes."""
 
     if isinstance(payload, list):
+        # inD/rounD release a bare list of {"frame_id": ..., "vehicles": [...]}
+        # frame objects, while highD/CitySim release a flat list of per-frame
+        # vehicle records.
+        if payload and isinstance(payload[0], dict) and "vehicles" in payload[0]:
+            return _flatten_nested_frames(payload, schema)
         return [record for record in payload if isinstance(record, dict)]
 
     if not isinstance(payload, dict):
@@ -345,25 +417,7 @@ def flatten_records(payload: object, schema: str) -> List[Dict[str, object]]:
                 return [record for record in records if isinstance(record, dict)]
         raise ConversionError("Event object does not contain frames/records/data.")
 
-    frame_key = "frame" if schema == "highd" else "frame_id"
-    flattened: List[Dict[str, object]] = []
-
-    for frame in frames:
-        if not isinstance(frame, dict):
-            continue
-        frame_id = frame.get("frame_id", frame.get("frame"))
-        vehicles = frame.get("vehicles", [])
-        if not isinstance(vehicles, list):
-            continue
-
-        for vehicle in vehicles:
-            if not isinstance(vehicle, dict):
-                continue
-            record = dict(vehicle)
-            record.setdefault(frame_key, frame_id)
-            flattened.append(record)
-
-    return flattened
+    return _flatten_nested_frames(frames, schema)
 
 
 def record_fields(schema: str) -> Dict[str, object]:
@@ -392,6 +446,35 @@ def record_fields(schema: str) -> Dict[str, object]:
             "right_alongside": "rightAlongsideId",
             "zero_relation_is_missing": True,
             "behaviour": ("acc_high", "brake_high", "yaw_left", "yaw_right"),
+        }
+
+    if schema in ("ind", "round"):
+        return {
+            "id": "trackId",
+            "frame": "frame_id",
+            "x": "xCenter",
+            "y": "yCenter",
+            "length": "length",
+            "speed": "lonVelocity",
+            "vx": "xVelocity",
+            "vy": "yVelocity",
+            "ax": "xAcceleration",
+            "ay": "yAcceleration",
+            "accel": ("lonAcceleration",),
+            "heading": "heading",
+            "yaw_rate": None,
+            "risk": "risk_value",
+            "ttc": None,
+            "front": ("preceding_id",),
+            "left_front": ("left_preceding_id",),
+            "left_rear": ("left_following_id",),
+            "right_front": ("right_preceding_id",),
+            "right_rear": ("right_following_id",),
+            "left_alongside": "left_alongside_id",
+            "right_alongside": "right_alongside_id",
+            # inD/rounD use NaN for a missing relation, so ID 0 is valid.
+            "zero_relation_is_missing": False,
+            "behaviour": (),
         }
 
     return {
@@ -634,6 +717,47 @@ def choose_peak_frame(
     return int(finite_number(ego_records[fallback_index].get(frame_field)))
 
 
+def detect_lane_change(
+    ego_records: Sequence[Mapping[str, object]],
+    fields: Mapping[str, object],
+    peak_frame: int,
+    schema: str,
+) -> Optional[str]:
+    """Return CHANGE_LEFT/CHANGE_RIGHT when the ego makes a lateral maneuver.
+
+    highD carries explicit per-frame ``yaw_left``/``yaw_right`` flags, which are
+    ground-truth lateral-movement signals (not a heuristic). They describe the
+    driver's actual maneuver, so they are used only to add the otherwise nearly
+    absent lane-change policy examples. CitySim's threshold-based turn labels
+    are intentionally ignored because the release documents them as coarse and,
+    in FreewayB, permissive.
+    """
+
+    if schema != "highd":
+        return None
+
+    frame_field = str(fields["frame"])
+    behaviour_fields = fields["behaviour"]  # (acc_high, brake_high, yaw_left, yaw_right)
+    left_name = str(behaviour_fields[2])
+    right_name = str(behaviour_fields[3])
+
+    window = [
+        record
+        for record in ego_records
+        if abs(int(finite_number(record.get(frame_field))) - peak_frame) <= 3
+    ]
+    if not window:
+        window = ego_records
+
+    left = any(bool(record.get(left_name)) for record in window)
+    right = any(bool(record.get(right_name)) for record in window)
+    if left and not right:
+        return ACTION_NAMES[DrivingAction.CHANGE_LEFT]
+    if right and not left:
+        return ACTION_NAMES[DrivingAction.CHANGE_RIGHT]
+    return None
+
+
 def build_states(
     records: Sequence[Mapping[str, object]],
     ego_id: str,
@@ -824,6 +948,7 @@ def convert_event(
         "group_id": path.stem,
         "timestamp": float(states[-1]["timestamp"]),
     }
+    lane_change = detect_lane_change(ego_records, fields, peak_frame, schema)
     audit = {
         "underlying_source": str(candidate["source"]),
         "history_frames": len(states),
@@ -831,6 +956,7 @@ def convert_event(
             states[-1]["timestamp"] - states[0]["timestamp"]
         ),
         "peak_frame": peak_frame,
+        "lane_change": lane_change,
     }
 
     row: Dict[str, object] = dict(metadata)
@@ -977,6 +1103,12 @@ def run_conversion(arguments: argparse.Namespace) -> Dict[str, object]:
             severity_counts[str(candidate["severity"])] += 1
             history_frames.append(int(audit["history_frames"]))
             history_durations.append(float(audit["history_duration_seconds"]))
+
+            lane_change = audit.get("lane_change")
+            if lane_change is not None:
+                lane_row = dict(risk_row)
+                lane_row["target"] = lane_change
+                policy_rows.append(lane_row)
 
             action_id = gpt_actions.get(str(candidate["stem"]))
             if action_id is not None:
