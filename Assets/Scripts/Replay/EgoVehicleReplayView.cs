@@ -15,8 +15,6 @@ public class EgoVehicleReplayView : MonoBehaviour
     [SerializeField] private bool smoothStreamingSources = true;
     [SerializeField, Min(0f)] private float positionSmoothness = 18f;
     [SerializeField, Min(0f)] private float rotationSmoothness = 14f;
-    [Tooltip("Briefly predict forward between stream messages, then freeze until a fresh snapshot arrives.")]
-    [SerializeField, Min(0f)] private float maximumExtrapolationSeconds = 0.2f;
 
     private Renderer[] presentationRenderers;
     private bool[] rendererEnabledDefaults;
@@ -60,20 +58,6 @@ public class EgoVehicleReplayView : MonoBehaviour
             0f,
             stateManager.Ego.yawDegrees + modelYawOffset,
             0f);
-
-        if (streaming && metadata != null && maximumExtrapolationSeconds > 0f)
-        {
-            float age = Mathf.Clamp(
-                (float)(Time.realtimeSinceStartup - metadata.receiptTimestampSeconds),
-                0f,
-                maximumExtrapolationSeconds);
-            float distance = Mathf.Max(
-                0f,
-                stateManager.Ego.speedMetersPerSecond * age +
-                0.5f * stateManager.Ego.longitudinalAcceleration * age * age);
-            Vector3 forward = Quaternion.Euler(0f, stateManager.Ego.yawDegrees, 0f) * Vector3.forward;
-            targetPosition += forward * distance;
-        }
 
         string sessionId = metadata?.session?.sessionId;
         bool newSession = !string.Equals(presentedSessionId, sessionId, System.StringComparison.Ordinal);
