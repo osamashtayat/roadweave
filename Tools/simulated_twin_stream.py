@@ -10,7 +10,8 @@ to cruise, follow, brake, change lanes, pass, or return to the right lane.
 Data:     Python -> UDP 5055 -> Unity
 Controls: Unity  -> UDP 5056 -> Python
 
-Only Python standard-library modules are required.
+Rule-controller mode uses only Python standard-library modules. ML-controller
+mode additionally uses the packages installed in ML/.venv.
 """
 
 import argparse
@@ -19,12 +20,15 @@ import math
 import random
 import secrets
 import socket
+import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 
 VALID = 1
+PARTIAL = 2
 FRESH = 1
 
 ACTOR_CAR = 1
@@ -43,6 +47,13 @@ LEFT_SIDEWALK_X = -7.2
 EGO_WIDTH_METERS = 1.9
 EGO_LENGTH_METERS = 4.6
 CRUISE_SPEED_MPS = 13.9
+ROUTE_SAMPLE_SPACING_METERS = 2.0
+ROUTE_WINDOW_STEP_METERS = 200.0
+ROUTE_LOOK_BEHIND_METERS = 180.0
+ROUTE_LOOK_AHEAD_METERS = 900.0
+ROUTE_OUTPUT_SPACING_METERS = 18.0
+ROUTE_PUBLISH_RATE_HZ = 1.0
+UDP_SAFE_PAYLOAD_BYTES = 8000
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
@@ -53,6 +64,97 @@ def move_towards(current: float, target: float, maximum_delta: float) -> float:
     if abs(target - current) <= maximum_delta:
         return target
     return current + math.copysign(maximum_delta, target - current)
+
+
+def shortest_angle_delta_degrees(current: float, target: float) -> float:
+    return (target - current + 180.0) % 360.0 - 180.0
+
+
+@dataclass(frozen=True)
+class RoutePose:
+    x: float
+    z: float
+    yaw_degrees: float
+
+
+class ProceduralRoad:
+    """An unlimited, deterministic road centerline for one simulator seed.
+
+    Distance along the route is kept separate from Unity world coordinates.
+    This lets sensors and driving decisions use stable lane-relative distances
+    while the published road turns left and right in world space.
+    """
+
+    def __init__(self, seed: int) -> None:
+        route_random = random.Random(seed ^ 0x5A17C9E3)
+        self.primary_amplitude = math.radians(route_random.uniform(18.0, 31.0))
+        self.secondary_amplitude = math.radians(route_random.uniform(7.0, 15.0))
+        self.primary_scale = route_random.uniform(105.0, 165.0)
+        self.secondary_scale = route_random.uniform(42.0, 78.0)
+        self.primary_phase = route_random.uniform(0.0, math.tau)
+        self.secondary_phase = route_random.uniform(0.0, math.tau)
+        self.samples: List[Tuple[float, float, float]] = [(0.0, 0.0, 0.0)]
+
+    def _heading_radians(self, route_distance: float) -> float:
+        if route_distance <= 0.0:
+            return 0.0
+        primary = self.primary_amplitude * math.sin(
+            route_distance / self.primary_scale + self.primary_phase
+        )
+        secondary = self.secondary_amplitude * math.sin(
+            route_distance / self.secondary_scale + self.secondary_phase
+        )
+        ramp = clamp(route_distance / 90.0, 0.0, 1.0)
+        ramp = ramp * ramp * (3.0 - 2.0 * ramp)
+        return clamp(
+            (primary + secondary) * ramp,
+            math.radians(-68.0),
+            math.radians(68.0),
+        )
+
+    def _ensure_distance(self, route_distance: float) -> None:
+        target = max(0.0, route_distance)
+        while self.samples[-1][0] + 0.001 < target + ROUTE_SAMPLE_SPACING_METERS:
+            previous_s, previous_x, previous_z = self.samples[-1]
+            next_s = previous_s + ROUTE_SAMPLE_SPACING_METERS
+            midpoint = (previous_s + next_s) * 0.5
+            heading = self._heading_radians(midpoint)
+            next_x = previous_x + math.sin(heading) * ROUTE_SAMPLE_SPACING_METERS
+            next_z = previous_z + math.cos(heading) * ROUTE_SAMPLE_SPACING_METERS
+            self.samples.append((next_s, next_x, next_z))
+
+    def pose(self, route_distance: float, lateral_offset: float = 0.0) -> RoutePose:
+        if route_distance < 0.0:
+            base_x = 0.0
+            base_z = route_distance
+            heading = 0.0
+        else:
+            self._ensure_distance(route_distance)
+            lower_index = int(route_distance / ROUTE_SAMPLE_SPACING_METERS)
+            upper_index = min(lower_index + 1, len(self.samples) - 1)
+            lower_s, lower_x, lower_z = self.samples[lower_index]
+            upper_s, upper_x, upper_z = self.samples[upper_index]
+            span = max(0.001, upper_s - lower_s)
+            blend = clamp((route_distance - lower_s) / span, 0.0, 1.0)
+            base_x = lower_x + (upper_x - lower_x) * blend
+            base_z = lower_z + (upper_z - lower_z) * blend
+            heading = self._heading_radians(route_distance)
+
+        # Positive local X is the route's right side, matching Unity's frame.
+        base_x += math.cos(heading) * lateral_offset
+        base_z -= math.sin(heading) * lateral_offset
+        return RoutePose(base_x, base_z, math.degrees(heading))
+
+    def velocity(
+        self,
+        route_distance: float,
+        forward_speed_mps: float,
+        lateral_speed_mps: float = 0.0,
+    ) -> Tuple[float, float]:
+        heading = self._heading_radians(route_distance)
+        x = math.sin(heading) * forward_speed_mps + math.cos(heading) * lateral_speed_mps
+        z = math.cos(heading) * forward_speed_mps - math.sin(heading) * lateral_speed_mps
+        return x, z
 
 
 @dataclass
@@ -120,47 +222,63 @@ class SensorFrame:
 
 
 class ProceduralScenarioPlanner:
-    """Builds random encounters without embedding driving decisions."""
+    """Continuously builds random encounters without driving decisions."""
 
     def __init__(self, seed: int) -> None:
         self.seed = seed
         self.random = random.Random(seed)
+        self.next_index = 0
+        self.kind_bag: List[str] = []
 
     def build(self, encounter_count: int) -> List[SimulatedActor]:
-        encounter_count = max(4, encounter_count)
-        kinds = ["slow_car", "stopped_car", "truck", "pedestrian"]
-        while len(kinds) < encounter_count:
-            kinds.append(
+        actors: List[SimulatedActor] = []
+        event_z = self.random.uniform(58.0, 75.0)
+        for _ in range(max(4, encounter_count)):
+            actors.extend(self.build_next(event_z))
+            event_z += self.next_spacing()
+        actors.sort(key=lambda candidate: candidate.z)
+        return actors
+
+    def build_next(self, event_z: float) -> List[SimulatedActor]:
+        index = self.next_index
+        self.next_index += 1
+        kind = self._next_kind()
+        actor = self._primary_actor(index, kind, event_z)
+        actors = [actor]
+
+        # Some encounters include traffic in the other lane. The simulated
+        # sensors must notice it and delay or adapt the overtake.
+        if kind != "pedestrian" and actor.lane_x == RIGHT_LANE_X:
+            if self.random.random() < 0.38:
+                actors.append(self._left_lane_companion(index, event_z))
+        return actors
+
+    def next_spacing(self) -> float:
+        return self.random.uniform(68.0, 108.0)
+
+    def _next_kind(self) -> str:
+        if not self.kind_bag:
+            # Every bag contains all core hazards, plus two weighted random
+            # additions. This keeps an infinite run varied without long gaps
+            # where one important behavior is never exercised.
+            self.kind_bag = ["slow_car", "stopped_car", "truck", "pedestrian"]
+            self.kind_bag.extend(
                 self.random.choices(
                     ["slow_car", "stopped_car", "truck", "pedestrian"],
                     weights=[0.34, 0.25, 0.23, 0.18],
-                    k=1,
-                )[0]
+                    k=2,
+                )
             )
-        self.random.shuffle(kinds)
+            self.random.shuffle(self.kind_bag)
+        return self.kind_bag.pop()
 
-        actors: List[SimulatedActor] = []
-        event_z = self.random.uniform(58.0, 75.0)
-
-        for index, kind in enumerate(kinds):
-            actor = self._primary_actor(index, kind, event_z)
-            actors.append(actor)
-
-            # Some encounters include traffic in the other lane. The sensor
-            # suite must notice it and delay or adapt the overtake.
-            if kind != "pedestrian" and actor.lane_x == RIGHT_LANE_X:
-                if self.random.random() < 0.38:
-                    actors.append(self._left_lane_companion(index, event_z))
-
-            event_z += self.random.uniform(68.0, 108.0)
-
-        actors.sort(key=lambda candidate: candidate.z)
-        return actors
+    def _actor_id(self, label: str, index: int) -> str:
+        return f"sim-{self.seed:08x}-{label}-{index:05d}"
 
     def _primary_actor(self, index: int, kind: str, z: float) -> SimulatedActor:
         if kind == "pedestrian":
             return SimulatedActor(
-                actor_id=f"sim-pedestrian-{index:02d}",
+                actor_id=self._actor_id("pedestrian", index),
                 kind="pedestrian",
                 lane_x=RIGHT_SIDEWALK_X,
                 z=z,
@@ -174,7 +292,7 @@ class ProceduralScenarioPlanner:
         lane_x = RIGHT_LANE_X if self.random.random() < 0.82 else LEFT_LANE_X
         if kind == "truck":
             return SimulatedActor(
-                actor_id=f"sim-truck-{index:02d}",
+                actor_id=self._actor_id("truck", index),
                 kind="truck",
                 lane_x=lane_x,
                 z=z,
@@ -187,7 +305,7 @@ class ProceduralScenarioPlanner:
 
         stopped = kind == "stopped_car"
         return SimulatedActor(
-            actor_id=f"sim-{'stopped' if stopped else 'slow'}-car-{index:02d}",
+            actor_id=self._actor_id("stopped-car" if stopped else "slow-car", index),
             kind=kind,
             lane_x=lane_x,
             z=z,
@@ -200,7 +318,7 @@ class ProceduralScenarioPlanner:
 
     def _left_lane_companion(self, index: int, event_z: float) -> SimulatedActor:
         return SimulatedActor(
-            actor_id=f"sim-left-traffic-{index:02d}",
+            actor_id=self._actor_id("left-traffic", index),
             kind="traffic_car",
             lane_x=LEFT_LANE_X,
             z=event_z + self.random.uniform(-18.0, 28.0),
@@ -302,7 +420,11 @@ class AutonomousDrivingController:
         ego_speed_mps: float,
         sensors: SensorFrame,
         actors_by_id: Dict[str, SimulatedActor],
+        simulation_time: float = 0.0,
+        ego_acceleration: float = 0.0,
+        ego_yaw_rate: float = 0.0,
     ) -> Tuple[float, float, str]:
+        del simulation_time, ego_acceleration, ego_yaw_rate
         pedestrian = sensors.pedestrian_hazard
         if pedestrian is not None:
             stop_gap = pedestrian.longitudinal_gap - 5.0
@@ -467,15 +589,22 @@ class SimulatedWorld:
         configured_seed: Optional[int],
         encounter_count: int,
         announce: bool = True,
+        controller_factory: Optional[Callable[[], Any]] = None,
     ) -> None:
         self.include_actors = include_actors
         self.configured_seed = configured_seed
         self.encounter_count = max(4, encounter_count)
         self.announce = announce
+        self.controller_factory = controller_factory
         self.reset_count = 0
         self.sensors = SimulatedSensorSuite()
-        self.controller = AutonomousDrivingController()
+        self.controller = self._new_controller()
         self.reset()
+
+    def _new_controller(self) -> Any:
+        if self.controller_factory is not None:
+            return self.controller_factory()
+        return AutonomousDrivingController()
 
     def reset(self) -> None:
         self.scenario_seed = (
@@ -485,24 +614,29 @@ class SimulatedWorld:
         )
         self.reset_count += 1
         self.simulation_time = 0.0
+        self.road = ProceduralRoad(self.scenario_seed)
         self.ego_x = RIGHT_LANE_X
         self.ego_y = 0.0
         self.ego_z = 0.0
         self.ego_yaw_degrees = 0.0
+        self.ego_heading_offset_degrees = 0.0
         self.ego_yaw_rate = 0.0
         self.speed_mps = 0.0
         self.acceleration_mps2 = 0.0
         self.lateral_speed_mps = 0.0
         self.battery_percent = 92.0
-        self.controller = AutonomousDrivingController()
+        self.controller = self._new_controller()
         self.latest_sensors = SensorFrame()
         self.minimum_observed_clearance = math.inf
-        self.actors = (
-            ProceduralScenarioPlanner(self.scenario_seed).build(self.encounter_count)
-            if self.include_actors
-            else []
-        )
-        self.actors_by_id = {actor.actor_id: actor for actor in self.actors}
+        self.scenario_planner = ProceduralScenarioPlanner(self.scenario_seed)
+        self.next_event_z = self.scenario_planner.random.uniform(58.0, 75.0)
+        self.generation_horizon = max(650.0, self.encounter_count * 95.0)
+        self.actors: List[SimulatedActor] = []
+        self.actors_by_id: Dict[str, SimulatedActor] = {}
+        self.generated_encounter_count = 0
+        self.route_cache_revision = -1
+        self.route_cache: Optional[Dict[str, Any]] = None
+        self._ensure_future_scenarios()
         if self.announce:
             self._print_plan()
 
@@ -521,10 +655,40 @@ class SimulatedWorld:
             self.speed_mps,
             self.latest_sensors,
             self.actors_by_id,
+            simulation_time=self.simulation_time,
+            ego_acceleration=self.acceleration_mps2,
+            ego_yaw_rate=self.ego_yaw_rate,
         )
         self._update_ego(delta_seconds, target_speed, target_lane_x)
         self._enforce_non_penetration()
+        self._retire_passed_actors()
+        self._ensure_future_scenarios()
         self.battery_percent = max(0.0, self.battery_percent - 0.0003 * delta_seconds)
+
+    def _ensure_future_scenarios(self) -> None:
+        if not self.include_actors:
+            return
+        horizon_end = self.ego_z + self.generation_horizon
+        while self.next_event_z <= horizon_end:
+            new_actors = self.scenario_planner.build_next(self.next_event_z)
+            for actor in new_actors:
+                self.actors.append(actor)
+                self.actors_by_id[actor.actor_id] = actor
+            self.generated_encounter_count += 1
+            self.next_event_z += self.scenario_planner.next_spacing()
+
+    def _retire_passed_actors(self) -> None:
+        retained: List[SimulatedActor] = []
+        for actor in self.actors:
+            passed_and_expired = actor.cleared and actor.z < self.ego_z - 90.0
+            left_sensor_region = (
+                actor.active and not actor.is_pedestrian and actor.z > self.ego_z + 220.0
+            )
+            if passed_and_expired or left_sensor_region:
+                self.actors_by_id.pop(actor.actor_id, None)
+                continue
+            retained.append(actor)
+        self.actors = retained
 
     def _update_actors(self, delta_seconds: float) -> None:
         for actor in self.actors:
@@ -574,16 +738,20 @@ class SimulatedWorld:
             self.ego_x += self.lateral_speed_mps * delta_seconds
 
         self.ego_z += self.speed_mps * delta_seconds
-        desired_yaw = math.degrees(
+        desired_heading_offset = math.degrees(
             math.atan2(self.lateral_speed_mps, max(self.speed_mps, 2.0))
         )
-        previous_yaw = self.ego_yaw_degrees
-        self.ego_yaw_degrees = move_towards(
-            self.ego_yaw_degrees,
-            desired_yaw,
+        self.ego_heading_offset_degrees = move_towards(
+            self.ego_heading_offset_degrees,
+            desired_heading_offset,
             45.0 * delta_seconds,
         )
-        self.ego_yaw_rate = (self.ego_yaw_degrees - previous_yaw) / delta_seconds
+        previous_yaw = self.ego_yaw_degrees
+        route_yaw = self.road.pose(self.ego_z).yaw_degrees
+        self.ego_yaw_degrees = route_yaw + self.ego_heading_offset_degrees
+        self.ego_yaw_rate = shortest_angle_delta_degrees(
+            previous_yaw, self.ego_yaw_degrees
+        ) / delta_seconds
 
     def _enforce_non_penetration(self) -> None:
         for actor in self.actors:
@@ -627,12 +795,18 @@ class SimulatedWorld:
             if actor.active and not actor.cleared and -55.0 <= actor.z - self.ego_z <= 140.0
         ]
 
-    def create_snapshot(self, sequence_number: int) -> Dict[str, Any]:
+    def create_snapshot(
+        self,
+        sequence_number: int,
+        include_route: bool = True,
+    ) -> Dict[str, Any]:
         wheel_radius = 0.34
         wheel_rpm = self.speed_mps / (2.0 * math.pi * wheel_radius) * 60.0
         speed_kmh = self.speed_mps * 3.6
         throttle = clamp(self.acceleration_mps2 / 2.0, 0.0, 1.0) * 100.0
         brake = clamp(-self.acceleration_mps2 / 4.8, 0.0, 1.0)
+        ego_pose = self.road.pose(self.ego_z, self.ego_x)
+        ego_yaw = ego_pose.yaw_degrees + self.ego_heading_offset_degrees
 
         return {
             "metadata": {
@@ -658,8 +832,8 @@ class SimulatedWorld:
                 },
             },
             "ego": {
-                "position": {"x": round(self.ego_x, 5), "y": 0.0, "z": round(self.ego_z, 5)},
-                "yawDegrees": round(self.ego_yaw_degrees, 4),
+                "position": {"x": round(ego_pose.x, 5), "y": 0.0, "z": round(ego_pose.z, 5)},
+                "yawDegrees": round(ego_yaw, 4),
                 "speedMetersPerSecond": round(self.speed_mps, 4),
                 "longitudinalAcceleration": round(self.acceleration_mps2, 4),
                 "validity": VALID,
@@ -672,7 +846,10 @@ class SimulatedWorld:
                 "throttlePercent": round(throttle, 3),
                 "brake": round(brake, 4),
                 "brakeSwitch": 1 if brake > 0.01 else 0,
-                "steeringDegrees": round(self.ego_yaw_degrees * 1.8, 3),
+                "steeringDegrees": round(
+                    self.ego_heading_offset_degrees * 1.8 + self.ego_yaw_rate * 0.12,
+                    3,
+                ),
                 "steeringSpeed": round(abs(self.ego_yaw_rate), 3),
                 "yawRate": round(self.ego_yaw_rate, 3),
                 "leftSignal": 1 if self.controller.target_lane_x == LEFT_LANE_X and self.ego_x > LEFT_LANE_X + 0.2 else 0,
@@ -688,10 +865,22 @@ class SimulatedWorld:
                 "rearRightRpm": round(wheel_rpm, 4),
                 "validity": VALID,
             },
+            # Route geometry changes far more slowly than vehicle telemetry.
+            # Main sends it at 1 Hz; null means "keep the last route revision".
+            "route": self._route_state() if include_route else None,
             "actors": [self._actor_state(actor, sequence_number) for actor in self.visible_actors()],
         }
 
     def _actor_state(self, actor: SimulatedActor, sequence_number: int) -> Dict[str, Any]:
+        pose = self.road.pose(actor.z, actor.x)
+        velocity_x, velocity_z = self.road.velocity(
+            actor.z,
+            0.0 if actor.is_pedestrian else actor.speed_mps,
+            actor.lateral_speed_mps,
+        )
+        actor_yaw = pose.yaw_degrees
+        if actor.is_pedestrian and actor.lateral_speed_mps < -0.01:
+            actor_yaw -= 90.0
         return {
             "id": actor.actor_id,
             "semanticClass": actor.semantic_class,
@@ -700,12 +889,12 @@ class SimulatedWorld:
             "observationTimestampSeconds": round(self.simulation_time, 6),
             "observationSequenceNumber": sequence_number,
             "freshness": FRESH,
-            "position": {"x": round(actor.x, 5), "y": 0.0, "z": round(actor.z, 5)},
-            "yawDegrees": -90.0 if actor.is_pedestrian else 0.0,
+            "position": {"x": round(pose.x, 5), "y": 0.0, "z": round(pose.z, 5)},
+            "yawDegrees": round(actor_yaw, 4),
             "velocityMetersPerSecond": {
-                "x": round(actor.lateral_speed_mps, 5),
+                "x": round(velocity_x, 5),
                 "y": 0.0,
-                "z": 0.0 if actor.is_pedestrian else round(actor.speed_mps, 5),
+                "z": round(velocity_z, 5),
             },
             "dimensionsMeters": {"x": actor.width, "y": actor.height, "z": actor.length},
             "confidence": 0.97,
@@ -713,22 +902,57 @@ class SimulatedWorld:
             "validity": VALID,
         }
 
+    def _route_state(self) -> Dict[str, Any]:
+        revision = max(0, int(self.ego_z // ROUTE_WINDOW_STEP_METERS))
+        if self.route_cache is not None and revision == self.route_cache_revision:
+            return self.route_cache
+
+        window_anchor = revision * ROUTE_WINDOW_STEP_METERS
+        start = window_anchor - ROUTE_LOOK_BEHIND_METERS
+        end = window_anchor + ROUTE_LOOK_AHEAD_METERS
+        point_count = int(math.ceil((end - start) / ROUTE_OUTPUT_SPACING_METERS)) + 1
+        points: List[Dict[str, float]] = []
+        for index in range(point_count):
+            route_distance = min(
+                start + index * ROUTE_OUTPUT_SPACING_METERS,
+                end,
+            )
+            pose = self.road.pose(route_distance, RIGHT_LANE_X)
+            points.append(
+                {
+                    "x": round(pose.x, 4),
+                    "y": 0.0,
+                    "z": round(pose.z, 4),
+                }
+            )
+
+        self.route_cache_revision = revision
+        self.route_cache = {
+            "routeId": f"procedural-route-{self.scenario_seed:08x}",
+            "revision": revision,
+            "laneWidthMeters": abs(LEFT_LANE_X - RIGHT_LANE_X),
+            "points": points,
+            "validity": VALID,
+        }
+        return self.route_cache
+
     def nearest_front_description(self) -> str:
         hit = self.latest_sensors.current_front
         return "clear" if hit is None else f"{hit.actor.actor_id}:{hit.longitudinal_gap:.1f}m"
 
     def _print_plan(self) -> None:
         print()
-        print(f"Generated procedural scenario seed={self.scenario_seed}")
+        print(f"Generated unlimited procedural world seed={self.scenario_seed}")
         if not self.actors:
             print("  clear road (actors disabled)")
             return
+        print("  initial look-ahead queue (new encounters are added continuously):")
         for actor in self.actors:
             lane = "pedestrian crossing" if actor.is_pedestrian else (
                 "left" if actor.lane_x == LEFT_LANE_X else "right"
             )
             print(
-                f"  {actor.actor_id:25s} z={actor.z:6.1f}m "
+                f"  {actor.actor_id:38s} route={actor.z:6.1f}m "
                 f"lane={lane:19s} speed={actor.speed_mps * 3.6:4.1f}km/h"
             )
 
@@ -740,11 +964,41 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--control-host", default="127.0.0.1")
     parser.add_argument("--control-port", type=int, default=5056)
     parser.add_argument("--rate", type=float, default=30.0, help="Snapshots per second. Default: 30")
-    parser.add_argument("--encounters", type=int, default=7, help="Primary encounters per generated run. Default: 7")
+    parser.add_argument(
+        "--encounters",
+        type=int,
+        default=7,
+        help="Approximate future encounters kept queued in the unlimited world. Default: 7",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Optional reproducible base seed.")
     parser.add_argument("--no-actors", action="store_true", help="Generate a clear road only.")
     parser.add_argument("--actors", action="store_true", help="Compatibility option; actors are enabled by default.")
     parser.add_argument("--autostart", action="store_true")
+    parser.add_argument(
+        "--controller",
+        choices=("rule", "ml"),
+        default="rule",
+        help="Driving controller. 'rule' remains the safe default.",
+    )
+    project_root = Path(__file__).resolve().parents[1]
+    parser.add_argument(
+        "--risk-model",
+        type=Path,
+        default=project_root / "ML" / "models" / "risk_model.joblib",
+        help="Risk artifact used only with --controller ml.",
+    )
+    parser.add_argument(
+        "--policy-model",
+        type=Path,
+        default=project_root / "ML" / "models" / "policy_model.joblib",
+        help="Policy artifact used only with --controller ml.",
+    )
+    parser.add_argument(
+        "--ml-decision-rate",
+        type=float,
+        default=5.0,
+        help="ML decisions per second; physics and safety still run at --rate. Default: 5",
+    )
     parser.add_argument("--self-test", action="store_true", help="Run deterministic safety checks and exit.")
     return parser.parse_args()
 
@@ -762,42 +1016,190 @@ def receive_control_commands(control_socket: socket.socket) -> List[str]:
     return commands
 
 
-def run_self_test() -> None:
-    world = SimulatedWorld(True, configured_seed=20260824, encounter_count=8, announce=False)
+def _compact_json_bytes(snapshot: Dict[str, Any]) -> bytes:
+    return json.dumps(
+        snapshot,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def encode_snapshot_for_udp(
+    snapshot: Dict[str, Any],
+    maximum_bytes: int = UDP_SAFE_PAYLOAD_BYTES,
+) -> bytes:
+    """Fits one canonical snapshot inside a conservative UDP datagram budget.
+
+    Required ego telemetry is never reduced. Optional route points are thinned
+    first. If an unusually crowded frame is still too large, the route is
+    omitted for that frame and the farthest presentation-only actor tracks are
+    removed while metadata is marked Partial.
+    """
+
+    candidate = snapshot
+    payload = _compact_json_bytes(candidate)
+    if len(payload) <= maximum_bytes:
+        return payload
+
+    route = snapshot.get("route")
+    if isinstance(route, dict) and isinstance(route.get("points"), list):
+        candidate = dict(snapshot)
+        compact_route = dict(route)
+        points = list(route["points"])
+        compact_route["points"] = points
+        candidate["route"] = compact_route
+
+        while len(payload) > maximum_bytes and len(points) > 2:
+            last_point = points[-1]
+            points = points[::2]
+            if points[-1] is not last_point:
+                points.append(last_point)
+            compact_route["points"] = points
+            payload = _compact_json_bytes(candidate)
+
+    if len(payload) > maximum_bytes and candidate.get("route") is not None:
+        candidate = dict(candidate)
+        candidate["route"] = None
+        payload = _compact_json_bytes(candidate)
+
+    if len(payload) > maximum_bytes:
+        ego_position = snapshot.get("ego", {}).get("position", {})
+        ego_x = float(ego_position.get("x", 0.0))
+        ego_z = float(ego_position.get("z", 0.0))
+
+        def distance_squared(actor_state: Dict[str, Any]) -> float:
+            position = actor_state.get("position", {})
+            delta_x = float(position.get("x", 0.0)) - ego_x
+            delta_z = float(position.get("z", 0.0)) - ego_z
+            return delta_x * delta_x + delta_z * delta_z
+
+        actors = sorted(
+            list(snapshot.get("actors") or []),
+            key=distance_squared,
+        )
+        candidate = dict(candidate)
+        metadata = dict(snapshot.get("metadata") or {})
+        metadata["validity"] = PARTIAL
+        metadata["validityMessage"] = (
+            "UDP payload budget retained the nearest surrounding actors."
+        )
+        candidate["metadata"] = metadata
+        candidate["actors"] = actors
+        payload = _compact_json_bytes(candidate)
+        while len(payload) > maximum_bytes and actors:
+            actors.pop()
+            payload = _compact_json_bytes(candidate)
+
+    if len(payload) > maximum_bytes:
+        raise ValueError(
+            f"Canonical snapshot is {len(payload)} bytes after compaction; "
+            f"the configured UDP budget is {maximum_bytes} bytes."
+        )
+    return payload
+
+
+def run_self_test(
+    controller_factory: Optional[Callable[[], Any]] = None,
+    controller_name: str = "rule",
+) -> None:
+    world = SimulatedWorld(
+        True,
+        configured_seed=20260824,
+        encounter_count=8,
+        announce=False,
+        controller_factory=controller_factory,
+    )
     observed_behaviors = set()
-    for _ in range(3000):
+    initial_generated_count = world.generated_encounter_count
+    observed_actor_ids = set(world.actors_by_id)
+    step_count = 7000 if controller_factory is None else 3500
+    for _ in range(step_count):
         world.update(0.05)
         observed_behaviors.add(world.controller.behavior)
+        observed_actor_ids.update(world.actors_by_id)
         assert math.isfinite(world.ego_x) and math.isfinite(world.ego_z)
         assert world.speed_mps >= -0.001
         for actor in world.visible_actors():
             lateral_overlap = abs(world.ego_x - actor.x) < (EGO_WIDTH_METERS + actor.width) * 0.5
             longitudinal_overlap = abs(world.ego_z - actor.z) < (EGO_LENGTH_METERS + actor.length) * 0.5
             assert not (lateral_overlap and longitudinal_overlap), f"collision with {actor.actor_id}"
-    assert (
-        AutonomousDrivingController.BRAKING_FOR_PEDESTRIAN in observed_behaviors
-        or AutonomousDrivingController.EMERGENCY_STOP in observed_behaviors
-    )
-    assert any(
-        behavior in observed_behaviors
-        for behavior in (
-            AutonomousDrivingController.FOLLOWING,
-            AutonomousDrivingController.CHANGE_LEFT,
-            AutonomousDrivingController.CHANGE_RIGHT,
+    snapshot = world.create_snapshot(0)
+    encoded_snapshot = encode_snapshot_for_udp(snapshot)
+    route_points = snapshot["route"]["points"]
+    route_headings = [world.road.pose(distance).yaw_degrees for distance in (100.0, 300.0, 500.0, 700.0, 900.0)]
+    assert len(route_points) > 40
+    assert len(encoded_snapshot) <= UDP_SAFE_PAYLOAD_BYTES
+    assert max(route_headings) - min(route_headings) > 12.0
+    if controller_factory is None:
+        assert world.generated_encounter_count > initial_generated_count + 10
+        assert len(observed_actor_ids) > initial_generated_count + 10
+        assert (
+            AutonomousDrivingController.BRAKING_FOR_PEDESTRIAN in observed_behaviors
+            or AutonomousDrivingController.EMERGENCY_STOP in observed_behaviors
         )
-    )
-    print("RoadWeave simulator self-test passed.")
+        assert any(
+            behavior in observed_behaviors
+            for behavior in (
+                AutonomousDrivingController.FOLLOWING,
+                AutonomousDrivingController.CHANGE_LEFT,
+                AutonomousDrivingController.CHANGE_RIGHT,
+            )
+        )
+    else:
+        assert world.ego_z > 50.0
+        assert all(behavior.startswith("ML_") for behavior in observed_behaviors)
+    print("RoadWeave {} controller self-test passed.".format(controller_name))
     print("Observed behaviors: " + ", ".join(sorted(observed_behaviors)))
 
 
 def main() -> None:
     arguments = parse_arguments()
+    controller_factory: Optional[Callable[[], Any]] = None
+    if arguments.controller == "ml":
+        project_root = Path(__file__).resolve().parents[1]
+        if str(project_root) not in sys.path:
+            sys.path.insert(0, str(project_root))
+        try:
+            from ML.src.online_policy import OnlineModelBundle, RoadWeaveMLController
+        except ModuleNotFoundError as exception:
+            raise SystemExit(
+                "Could not import RoadWeave ML dependencies ({}). Activate ML/.venv "
+                "before using --controller ml.".format(exception)
+            )
+        try:
+            model_bundle = OnlineModelBundle.load(
+                arguments.risk_model,
+                arguments.policy_model,
+            )
+        except (FileNotFoundError, ValueError) as exception:
+            raise SystemExit(
+                "Could not start the ML controller: {}\n"
+                "Train both artifacts first, or run with --controller rule.".format(
+                    exception
+                )
+            )
+
+        def create_ml_controller() -> Any:
+            return RoadWeaveMLController(
+                model_bundle,
+                right_lane_x=RIGHT_LANE_X,
+                left_lane_x=LEFT_LANE_X,
+                cruise_speed_mps=CRUISE_SPEED_MPS,
+                decision_rate_hz=arguments.ml_decision_rate,
+            )
+
+        controller_factory = create_ml_controller
+
     if arguments.self_test:
-        run_self_test()
+        run_self_test(controller_factory, arguments.controller)
         return
 
     rate_hz = max(1.0, arguments.rate)
     interval_seconds = 1.0 / rate_hz
+    route_publish_interval = max(
+        1,
+        int(round(rate_hz / ROUTE_PUBLISH_RATE_HZ)),
+    )
     data_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     control_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     control_socket.bind((arguments.control_host, arguments.control_port))
@@ -808,6 +1210,7 @@ def main() -> None:
         configured_seed=arguments.seed,
         encounter_count=arguments.encounters,
         announce=arguments.autostart,
+        controller_factory=controller_factory,
     )
     # A non-autostart plan is not authoritative until Unity creates its source
     # session. Announce subsequent RESET-generated plans, not the unused draft.
@@ -824,6 +1227,13 @@ def main() -> None:
     print(f"Sending TwinSnapshots to {arguments.unity_host}:{arguments.data_port}")
     print(f"Listening for Unity controls on {arguments.control_host}:{arguments.control_port}")
     print(f"Rate: {rate_hz:.1f} Hz")
+    print("Controller: {}".format(arguments.controller))
+    if arguments.controller == "ml":
+        print("ML decision rate: {:.1f} Hz".format(arguments.ml_decision_rate))
+    print(
+        f"Route updates: {ROUTE_PUBLISH_RATE_HZ:.1f} Hz; "
+        f"UDP payload budget: {UDP_SAFE_PAYLOAD_BYTES} bytes"
+    )
     print("Waiting for Unity RESET/START." if not stream_enabled else "Simulation started automatically.")
 
     try:
@@ -876,11 +1286,19 @@ def main() -> None:
             if driving:
                 world.update(delta_seconds)
 
-            snapshot = world.create_snapshot(sequence_number)
-            json_bytes = json.dumps(
-                snapshot, separators=(",", ":"), ensure_ascii=False
-            ).encode("utf-8")
-            data_socket.sendto(json_bytes, unity_target)
+            include_route = sequence_number % route_publish_interval == 0
+            snapshot = world.create_snapshot(
+                sequence_number,
+                include_route=include_route,
+            )
+            try:
+                json_bytes = encode_snapshot_for_udp(snapshot)
+                data_socket.sendto(json_bytes, unity_target)
+            except (OSError, ValueError) as exception:
+                # A transient transport-size or socket failure must not end a
+                # live simulation session. The next 30 Hz update can recover.
+                if now - last_status_print >= 1.0:
+                    print(f"Snapshot send skipped: {exception}")
             sequence_number += 1
             next_send_time += interval_seconds
             if next_send_time < now - interval_seconds:

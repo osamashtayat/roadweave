@@ -108,6 +108,20 @@ InitTestScene*.unity*
 .DS_Store
 .vscode/
 
+# RoadWeave machine-learning environment and generated artifacts.
+# Keep ML source code and documentation in Git, but do not commit local
+# packages, prepared datasets, trained binaries, or generated reports.
+/ML/.venv/
+/ML/.matplotlib/
+/ML/data/processed/*
+!/ML/data/processed/.gitkeep
+/ML/models/*
+!/ML/models/.gitkeep
+/ML/reports/*
+!/ML/reports/.gitkeep
+__pycache__/
+*.py[cod]
+
 # Imported model source archives are recovery inputs, not Unity runtime assets.
 # This prevents newly downloaded archives from bloating future commits. Files
 # already tracked by Git remain preserved until the owner deliberately migrates

@@ -215,6 +215,15 @@ public class LiveTestCoordinator : MonoBehaviour
             TestVehicle = testVehicleObject.AddComponent<AutonomousTestVehicleController>();
         TestVehicle.ConfigureModelForwardYawOffset(testVehicleModelYawOffset);
 
+        // The bridge is created only on the temporary Test Lab clone. The live
+        // twin, scene hierarchy, and Canvas remain unchanged. If the external
+        // ML service is unavailable, the controller continues with its safe
+        // deterministic fallback instead of blocking the test.
+        TestLabMlDecisionBridge mlBridge = testVehicleObject.GetComponent<TestLabMlDecisionBridge>();
+        if (mlBridge == null)
+            mlBridge = testVehicleObject.AddComponent<TestLabMlDecisionBridge>();
+        TestVehicle.SetMlDecisionBridge(mlBridge);
+
         TestVehicle.SetRoute(route, capturedSpeedKph);
         TestVehicle.SetRunning(false);
 

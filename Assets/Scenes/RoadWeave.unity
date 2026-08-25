@@ -4761,6 +4761,10 @@ MonoBehaviour:
   modelYawOffset: 0
   applyPosition: 1
   applyRotation: 1
+  smoothStreamingSources: 1
+  positionSmoothness: 18
+  rotationSmoothness: 14
+  maximumExtrapolationSeconds: 0.2
 --- !u!114 &1154259290
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -5026,7 +5030,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SimulatedStreamTwinSource
   stateManager: {fileID: 75759230}
-  sourceId: '    roadweave-software-simulator '
+  sourceId: python simulator
   staleAfterSeconds: 1
   connectOnEnable: 1
 --- !u!4 &1252002548

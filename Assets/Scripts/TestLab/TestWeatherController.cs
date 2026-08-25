@@ -105,6 +105,8 @@ public class TestWeatherController : MonoBehaviour
         if (testVehicle == null)
             return;
 
+        testVehicle.SetWeatherContext(CurrentWeather.ToString());
+
         switch (CurrentWeather)
         {
             case TestWeatherType.Rain:

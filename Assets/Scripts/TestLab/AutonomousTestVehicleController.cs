@@ -76,6 +76,9 @@ public class AutonomousTestVehicleController : MonoBehaviour
     public bool HasConfirmedCollision => collisionReported;
     public bool IsPredictiveEmergencyStopActive { get; private set; }
     public string SensorSummary { get; private set; } = "No sensor scan yet";
+    public string DecisionSourceSummary => mlDecisionBridge != null
+        ? mlDecisionBridge.StatusSummary
+        : "ML: bridge unavailable (rule controller active)";
     public VehicleDecelerationReason CurrentDecelerationReason { get; private set; }
     public string CurrentManeuver
     {
@@ -111,6 +114,8 @@ public class AutonomousTestVehicleController : MonoBehaviour
     private readonly List<float> routeDistances = new List<float>();
     private Rigidbody physicsBody;
     private SimulatedVehicleSensorSuite sensorSuite;
+    private TestLabMlDecisionBridge mlDecisionBridge;
+    private TestLabMlDecision activeMlDecision;
     private int waypointIndex;
     private float routeProgress;
     private float routeLength;
@@ -121,6 +126,10 @@ public class AutonomousTestVehicleController : MonoBehaviour
     private float detectionFactor = 1f;
     private float weatherCruisingFactor = 1f;
     private float targetWeatherCruisingFactor = 1f;
+    private string weatherContext = "Dry";
+    private float previousMlSpeedMps;
+    private Vector3 previousMlForward;
+    private bool hasMlMotionSample;
     private bool obstacleWasDetected;
     private bool wasObstacleBraking;
     private bool collisionReported;
@@ -145,6 +154,7 @@ public class AutonomousTestVehicleController : MonoBehaviour
         sensorSuite = GetComponent<SimulatedVehicleSensorSuite>();
         if (sensorSuite == null)
             sensorSuite = gameObject.AddComponent<SimulatedVehicleSensorSuite>();
+        mlDecisionBridge = GetComponent<TestLabMlDecisionBridge>();
         RefreshEgoCollisionEnvelope();
     }
 
@@ -175,7 +185,23 @@ public class AutonomousTestVehicleController : MonoBehaviour
         Vector3 routeRight = Quaternion.Euler(0f, 90f, 0f) * routeForward;
         physicalLaneOffset = Vector3.Dot(physicsBody.position - routeProjection, routeRight);
 
-        Vector3 egoVelocity = MovementForward * currentSpeedMps;
+        Vector3 currentMovementForward = MovementForward;
+        float measuredAcceleration = 0f;
+        float measuredYawRate = 0f;
+        if (hasMlMotionSample)
+        {
+            measuredAcceleration = (currentSpeedMps - previousMlSpeedMps) / Mathf.Max(0.001f, deltaTime);
+            measuredYawRate = Vector3.SignedAngle(
+                previousMlForward,
+                currentMovementForward,
+                Vector3.up
+            ) / Mathf.Max(0.001f, deltaTime);
+        }
+        previousMlSpeedMps = currentSpeedMps;
+        previousMlForward = currentMovementForward;
+        hasMlMotionSample = true;
+
+        Vector3 egoVelocity = currentMovementForward * currentSpeedMps;
         SimulatedSensorSnapshot sensors = sensorSuite.Scan(
             physicsBody.position,
             routeForward,
@@ -184,6 +210,25 @@ public class AutonomousTestVehicleController : MonoBehaviour
             transform,
             egoVelocity
         );
+        if (mlDecisionBridge != null)
+        {
+            mlDecisionBridge.RequestDecision(
+                sensors,
+                currentSpeedMps,
+                measuredAcceleration,
+                measuredYawRate,
+                physicalLaneOffset,
+                -overtakeLaneOffset,
+                GetMlCruiseSpeedMps(),
+                weatherContext
+            );
+            if (!mlDecisionBridge.TryGetFreshDecision(out activeMlDecision))
+                activeMlDecision = null;
+        }
+        else
+        {
+            activeMlDecision = null;
+        }
         UpdateSensorSummary(sensors);
         UpdateOvertakeState(routeForward, sensors, deltaTime);
 
@@ -229,6 +274,14 @@ public class AutonomousTestVehicleController : MonoBehaviour
         float unrestrictedSpeedMps = unrestrictedSpeedKph / 3.6f;
         float desiredSpeedMps = unrestrictedSpeedMps * speedFactor * weatherCruisingFactor;
         VehicleDecelerationReason requestedReason = GetEnvironmentDecelerationReason();
+
+        if (activeMlDecision != null)
+        {
+            float modelTarget = Mathf.Max(0f, activeMlDecision.targetSpeedMps);
+            if (modelTarget < desiredSpeedMps - 0.05f)
+                requestedReason = VehicleDecelerationReason.Maneuver;
+            desiredSpeedMps = Mathf.Min(desiredSpeedMps, modelTarget);
+        }
 
         float turnAngle = steeringDirection.sqrMagnitude > 0.001f
             ? Vector3.Angle(GetMovementForward(nextRotation), steeringDirection.normalized)
@@ -310,6 +363,10 @@ public class AutonomousTestVehicleController : MonoBehaviour
         HasReachedDestination = false;
         collisionReported = false;
         hasEverRun = false;
+        activeMlDecision = null;
+        hasMlMotionSample = false;
+        previousMlSpeedMps = currentSpeedMps;
+        previousMlForward = MovementForward;
         IsPredictiveEmergencyStopActive = false;
         obstacleWasDetected = false;
         wasObstacleBraking = false;
@@ -318,6 +375,12 @@ public class AutonomousTestVehicleController : MonoBehaviour
         ResetOvertake();
         RefreshEgoCollisionEnvelope();
         AlignWithRoute();
+        mlDecisionBridge?.BeginSession();
+    }
+
+    public void SetMlDecisionBridge(TestLabMlDecisionBridge bridge)
+    {
+        mlDecisionBridge = bridge;
     }
 
     public void SetRunning(bool shouldRun)
@@ -339,6 +402,11 @@ public class AutonomousTestVehicleController : MonoBehaviour
     public void SetWeatherCruisingFactor(float factor)
     {
         targetWeatherCruisingFactor = Mathf.Clamp(factor, 0.5f, 1f);
+    }
+
+    public void SetWeatherContext(string context)
+    {
+        weatherContext = string.IsNullOrWhiteSpace(context) ? "Dry" : context;
     }
 
     public void ConfigureMaximumSpeed(float speedKph)
@@ -509,8 +577,12 @@ public class AutonomousTestVehicleController : MonoBehaviour
         {
             SimulatedActorObservation actorAhead = sensors.rightLaneFront;
             float triggerDistance = GetOvertakeTriggerDistance(actorAhead);
+            bool modelRequestsLeft = activeMlDecision != null &&
+                activeMlDecision.Action == TestLabMlAction.ChangeLeft;
+            bool ruleRequestsOvertake = IsOvertakeCandidate(actorAhead) &&
+                actorAhead.gapDistance <= triggerDistance;
             if (Time.time >= retryAllowedTime && IsOvertakeCandidate(actorAhead) &&
-                actorAhead.gapDistance <= triggerDistance)
+                (modelRequestsLeft || ruleRequestsOvertake))
             {
                 overtakingActor = actorAhead.actor;
                 remainLeftAfterCurrentPass = ShouldRemainLeftAfterPassing(overtakingActor);
@@ -616,10 +688,12 @@ public class AutonomousTestVehicleController : MonoBehaviour
                 SimulatedActorObservation leftObstacle = sensors.leftLaneFront;
                 bool stoppedLeftVehicle = IsStoppedVehicle(leftObstacle) &&
                     leftObstacle.gapDistance <= overtakeStartDistance;
-                HoldClearTimer(stoppedLeftVehicle && rightClear, deltaTime);
+                bool modelRequestsRight = activeMlDecision != null &&
+                    activeMlDecision.Action == TestLabMlAction.ChangeRight;
+                HoldClearTimer((stoppedLeftVehicle || modelRequestsRight) && rightClear, deltaTime);
                 if (clearLaneTimer >= clearLaneHoldSeconds)
                 {
-                    overtakingActor = leftObstacle.actor;
+                    overtakingActor = leftObstacle != null ? leftObstacle.actor : null;
                     returnWasRequestedFromLeftCruise = true;
                     targetLaneOffset = 0f;
                     TransitionTo(OvertakePhase.Returning);
@@ -912,12 +986,24 @@ public class AutonomousTestVehicleController : MonoBehaviour
     private void UpdateSensorSummary(SimulatedSensorSnapshot sensors)
     {
         SensorSummary =
+            $"{DecisionSourceSummary}\n" +
             $"Range: {sensorSuite.EffectiveForwardRange:F0} m front / {sensorSuite.EffectiveRearRange:F0} m rear\n" +
             $"Right front: {DescribeObservation(sensors.rightLaneFront)}\n" +
             $"Right rear: {DescribeObservation(sensors.rightLaneRear)}\n" +
             $"Left front: {DescribeObservation(sensors.leftLaneFront)}\n" +
             $"Left rear: {DescribeObservation(sensors.leftLaneRear)}\n" +
             $"Pedestrian risk: {DescribeObservation(sensors.pedestrianHazard)}";
+    }
+
+    private float GetMlCruiseSpeedMps()
+    {
+        bool passing = overtakePhase == OvertakePhase.MovingOut ||
+                       overtakePhase == OvertakePhase.Passing ||
+                       overtakePhase == OvertakePhase.CruisingLeft;
+        float targetKph = passing
+            ? Mathf.Max(maximumSpeedKph, passingSpeedKph, 30f)
+            : maximumSpeedKph;
+        return targetKph * speedFactor * weatherCruisingFactor / 3.6f;
     }
 
     private static string DescribeObservation(SimulatedActorObservation observation)

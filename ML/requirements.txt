@@ -1,0 +1,11 @@
+numpy>=1.26,<3
+pandas>=2.2,<3
+pyarrow>=17,<25
+scipy>=1.13,<2
+scikit-learn>=1.5,<2
+joblib>=1.4,<2
+matplotlib>=3.9,<4
+seaborn>=0.13,<1
+tqdm>=4.66,<5
+nuscenes-devkit==1.2.0
+pyquaternion>=0.9.9,<1

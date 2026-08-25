@@ -145,6 +145,58 @@ public class StreamingRouteProviderTests
         }
     }
 
+    [Test]
+    public void AcceptedSnapshotRouteBuildsRoadAheadWithoutWaitingForBreadcrumbs()
+    {
+        GameObject stateRoot = new GameObject("StreamingStateManagerRouteTest");
+        GameObject providerRoot = new GameObject("StreamingRouteProviderRouteTest");
+        try
+        {
+            Type stateManagerType = FindRuntimeType("DigitalTwinStateManager");
+            Type snapshotType = FindRuntimeType("TwinSnapshot");
+            Type providerType = FindRuntimeType("StreamingRouteProvider");
+            Component stateManager = stateRoot.AddComponent(stateManagerType);
+            Component provider = providerRoot.AddComponent(providerType);
+
+            string json = CreateSnapshotJson(0, 0f).TrimEnd('}') +
+                          ",\"route\":{\"routeId\":\"route-a\",\"revision\":3," +
+                          "\"laneWidthMeters\":5.5,\"validity\":1,\"points\":[" +
+                          "{\"x\":0,\"y\":0,\"z\":0}," +
+                          "{\"x\":1,\"y\":0,\"z\":10}," +
+                          "{\"x\":4,\"y\":0,\"z\":20}]} }";
+            Type jsonUtilityType = typeof(GameObject).Assembly.GetType("UnityEngine.JsonUtility");
+            System.Reflection.MethodInfo fromJson = jsonUtilityType.GetMethod(
+                "FromJson",
+                new[] { typeof(string), typeof(Type) });
+            object snapshot = fromJson.Invoke(null, new object[] { json, snapshotType });
+
+            Assert.That((bool)stateManagerType.GetMethod("PublishSnapshot").Invoke(
+                stateManager, new[] { snapshot }), Is.True);
+            Assert.That((int)providerType.GetProperty("PointCount").GetValue(provider), Is.EqualTo(3));
+
+            // The 30 Hz telemetry packets between 1 Hz route updates omit the
+            // optional route. Unity must retain the last accepted revision.
+            object telemetryOnly = fromJson.Invoke(
+                null,
+                new object[] { CreateSnapshotJson(1, 5f), snapshotType });
+            Assert.That((bool)stateManagerType.GetMethod("PublishSnapshot").Invoke(
+                stateManager, new[] { telemetryOnly }), Is.True);
+            Assert.That((int)providerType.GetProperty("PointCount").GetValue(provider), Is.EqualTo(3));
+
+            List<Vector3> route = new List<Vector3>();
+            bool built = (bool)providerType.GetMethod("TryBuildTestRoute").Invoke(
+                provider,
+                new object[] { Vector3.zero, 0f, 1f, route });
+            Assert.That(built, Is.True);
+            Assert.That(route.Exists(point => point.x > 3.5f && point.z >= 20f), Is.True);
+        }
+        finally
+        {
+            UnityEngine.Object.DestroyImmediate(providerRoot);
+            UnityEngine.Object.DestroyImmediate(stateRoot);
+        }
+    }
+
     private static string CreateSnapshotJson(long sequence, float z)
     {
         return "{\"metadata\":{\"sequenceNumber\":" + sequence +

@@ -186,6 +186,20 @@ public class TwinWheelState
 }
 
 [Serializable]
+public class TwinRouteState
+{
+    [Tooltip("Stable route identifier within one source session.")]
+    public string routeId;
+    [Tooltip("Incremented only when the published route window changes.")]
+    public long revision;
+    [Tooltip("Distance between the two lane centerlines in meters.")]
+    public float laneWidthMeters;
+    [Tooltip("Ordered canonical positions for the ego/right-lane centerline.")]
+    public Vector3[] points = Array.Empty<Vector3>();
+    public TwinDataValidity validity = TwinDataValidity.Unknown;
+}
+
+[Serializable]
 public class TwinActorState
 {
     [Tooltip("Stable within a source session; never use a Unity instance ID here.")]
@@ -223,6 +237,8 @@ public class TwinSnapshot
     public TwinEgoState ego = new TwinEgoState();
     public TwinVehicleState vehicle = new TwinVehicleState();
     public TwinWheelState wheels = new TwinWheelState();
+    [Tooltip("Optional route-ahead data. Older sources may omit it.")]
+    public TwinRouteState route;
     public TwinActorState[] actors = Array.Empty<TwinActorState>();
 }
 

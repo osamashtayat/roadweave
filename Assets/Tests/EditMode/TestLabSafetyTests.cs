@@ -377,6 +377,43 @@ public class TestLabSafetyTests
         }
     }
 
+    [Test]
+    public void MlProtocolIsVersionedAndMapsOnlySupportedActions()
+    {
+        Type bridgeType = FindRuntimeType("TestLabMlDecisionBridge");
+        Type decisionType = FindRuntimeType("TestLabMlDecision");
+        Assert.That(
+            bridgeType.GetField("ProtocolVersion").GetRawConstantValue(),
+            Is.EqualTo("roadweave.testlab-ml/1.0")
+        );
+
+        MethodInfo parse = decisionType.GetMethod("ParseAction", BindingFlags.Public | BindingFlags.Static);
+        Assert.That(parse.Invoke(null, new object[] { "CHANGE_LEFT" }).ToString(), Is.EqualTo("ChangeLeft"));
+        Assert.That(parse.Invoke(null, new object[] { "DROP_TABLE" }).ToString(), Is.EqualTo("None"));
+    }
+
+    [Test]
+    public void ControllerAcceptsRuntimeMlBridgeWithoutSceneOrCanvasReference()
+    {
+        GameObject ego = new GameObject("MlBridgeEgo");
+        try
+        {
+            Type controllerType = FindRuntimeType("AutonomousTestVehicleController");
+            Type bridgeType = FindRuntimeType("TestLabMlDecisionBridge");
+            Component controller = CreateController(ego, controllerType);
+            Component bridge = ego.AddComponent(bridgeType);
+            controllerType.GetMethod("SetMlDecisionBridge").Invoke(controller, new object[] { bridge });
+
+            string summary = GetProperty<string>(controller, "DecisionSourceSummary");
+            Assert.That(summary, Does.StartWith("ML:"));
+            Assert.That(ego.GetComponent(bridgeType), Is.SameAs(bridge));
+        }
+        finally
+        {
+            UnityEngine.Object.DestroyImmediate(ego);
+        }
+    }
+
     private static void AssertLeftCruisePolicy(string motion, string expectedPhase)
     {
         GameObject ego = new GameObject("LeftCruiseEgo");

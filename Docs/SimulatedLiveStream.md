@@ -14,7 +14,7 @@ driving stack.
 ## Data flow
 
 ```text
-Procedural scenario planner
+Unlimited procedural route and scenario planner
         -> simulated road actors
         -> simulated sensor observations
         -> autonomous behavior controller
@@ -30,12 +30,27 @@ Procedural scenario planner
 Unity sends `RESET_START`, `RESET_PAUSE`, `START`, and `PAUSE` commands to the
 Python process on UDP port 5056.
 
-## Random scenarios
+Ego telemetry and surrounding actors are published at 30 Hz. Route geometry is
+published at 1 Hz and retained by Unity between route messages. Route points are
+automatically thinned if necessary so every UDP datagram remains below the safe
+8,000-byte transport budget used on macOS.
 
-Every Unity reset creates a new seed and a new ordered set of encounters. A run
-contains slow cars, stopped cars, trucks, pedestrian crossings, and sometimes
-traffic in the other lane. Their order, spacing, lane, speed, and supporting
-traffic vary. Stable actor IDs are preserved for the lifetime of that run.
+## Unlimited random world
+
+Every Unity reset creates a new seed, a different road shape, and a continuously
+refilled queue of encounters. The stream does not finish after the initial
+look-ahead queue. Passed actors are retired and new slow cars, stopped cars,
+trucks, pedestrians, and supporting traffic are generated farther ahead for as
+long as Unity keeps the session running. Their order, spacing, lane, speed, and
+supporting traffic vary. Every generated actor has a stable, unique ID for the
+lifetime of that source session.
+
+The road is represented internally by distance along a procedural route. Its
+world-space heading changes smoothly left and right. Sensors make decisions in
+lane-relative coordinates, while the canonical snapshot publishes curved Unity
+positions, rotations, velocities, and an optional look-ahead `route` section.
+Unity renders that route before the ego reaches it instead of extending one
+straight road forever.
 
 The planner only creates the world. It does not command the ego vehicle. The
 controller receives only the output of `SimulatedSensorSuite`.
@@ -78,7 +93,7 @@ cd "/Users/asus/Desktop/roadweave"
 python3 -B Tools/simulated_twin_stream.py
 ```
 
-More or fewer primary encounters:
+Keep a larger or smaller future encounter queue (the stream remains unlimited):
 
 ```bash
 python3 -B Tools/simulated_twin_stream.py --encounters 10
@@ -108,9 +123,10 @@ Run the built-in deterministic safety check:
 python3 -B Tools/simulated_twin_stream.py --self-test
 ```
 
-The console prints the generated seed and event list at reset. During driving it
-prints speed, lane, controller behavior, and the nearest front detection. Save
-the seed whenever a run needs to be reproduced.
+The console prints the generated seed and initial look-ahead queue at reset.
+During driving it prints speed, lane, controller behavior, and the nearest front
+detection. New encounters continue beyond that initial printed queue. Save the
+seed whenever a run needs to be reproduced.
 
 ## Unity presentation behavior
 
@@ -124,12 +140,19 @@ motorcycles, barriers, and generic road actors to the ego road plane. Imported
 visuals are centered on a stable actor root before the root is placed at half
 the actor height.
 
+`StreamingRouteProvider` prefers the optional route-ahead section published by
+the simulator and rebuilds the road only when its route revision changes. An
+older adapter that does not publish a route remains compatible: the provider
+falls back to building a breadcrumb route from accepted ego positions.
+
 ## Future sensor-gateway transition
 
 The future gateway replaces the planner, sensor simulator, and Python driving
 world. It must synchronize its real sensors, convert coordinates and units,
 assign validity/freshness, track surrounding objects with stable IDs, and emit
-the same `TwinSnapshot` contract. Unity presentation code remains unchanged.
+the same `TwinSnapshot` contract. A map or navigation service may populate the
+optional route section; if it is unavailable, Unity retains its ego-breadcrumb
+fallback. Unity presentation code remains unchanged.
 
 For a real vehicle, RoadWeave Live Twin visualizes the vehicle's authoritative
 state; it must not send simulated throttle, brake, or steering commands to the

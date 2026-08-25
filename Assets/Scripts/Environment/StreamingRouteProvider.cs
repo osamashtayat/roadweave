@@ -35,6 +35,8 @@ public sealed class StreamingRouteProvider : MonoBehaviour, ITestWorldRouteProvi
     private string activeSessionId;
     private TwinSourceKind activeSourceKind = TwinSourceKind.Unknown;
     private bool routeOwnedByExternalAdapter;
+    private string streamedRouteId;
+    private long streamedRouteRevision = long.MinValue;
 
     public string ProviderName => "Streaming / simulation route";
     public bool IsRouteAvailable => routePoints.Count > 1;
@@ -92,6 +94,8 @@ public sealed class StreamingRouteProvider : MonoBehaviour, ITestWorldRouteProvi
     {
         routePoints.Clear();
         renderedRoutePoints.Clear();
+        streamedRouteId = null;
+        streamedRouteRevision = long.MinValue;
         EnsureRouteSurface();
         routeSurface.Clear();
     }
@@ -149,10 +153,49 @@ public sealed class StreamingRouteProvider : MonoBehaviour, ITestWorldRouteProvi
              snapshot.ego.validity != TwinDataValidity.Partial))
             return;
 
+        // A streaming adapter may publish an optional look-ahead route. This
+        // is preferred over the historical ego breadcrumb because it lets the
+        // road curve before the vehicle reaches it. Older sources can omit the
+        // field and keep the existing breadcrumb behavior.
+        if (TryApplySnapshotRoute(snapshot.route))
+            return;
+
+        // Route-ahead geometry is intentionally published less frequently
+        // than 30 Hz telemetry. Once received, retain it when later snapshots
+        // omit the optional route field. A source that never supplies a route
+        // still uses the ego-breadcrumb fallback below.
+        if (streamedRouteId != null)
+            return;
+
         Transform coordinateRoot = canonicalCoordinateRoot != null ? canonicalCoordinateRoot : transform;
         Vector3 worldPoint = coordinateRoot.TransformPoint(snapshot.ego.position);
         if (AppendPointInternal(worldPoint))
             RebuildSurface();
+    }
+
+    private bool TryApplySnapshotRoute(TwinRouteState route)
+    {
+        if (route == null ||
+            (route.validity != TwinDataValidity.Valid &&
+             route.validity != TwinDataValidity.Partial) ||
+            route.points == null || route.points.Length < 2)
+            return false;
+
+        string routeId = route.routeId ?? string.Empty;
+        if (string.Equals(streamedRouteId, routeId, System.StringComparison.Ordinal) &&
+            streamedRouteRevision == route.revision)
+            return true;
+
+        routePoints.Clear();
+        renderedRoutePoints.Clear();
+        Transform coordinateRoot = canonicalCoordinateRoot != null ? canonicalCoordinateRoot : transform;
+        for (int index = 0; index < route.points.Length; index++)
+            AppendPointInternal(coordinateRoot.TransformPoint(route.points[index]));
+
+        streamedRouteId = routeId;
+        streamedRouteRevision = route.revision;
+        RebuildSurface();
+        return true;
     }
 
     public void EnterTestMode()
