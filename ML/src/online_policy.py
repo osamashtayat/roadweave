@@ -125,9 +125,13 @@ class RoadWeaveMLController:
         pedestrian_emergency = self._pedestrian_emergency(ego_speed_mps, sensors)
         if pedestrian_emergency is not None:
             target_speed, reason = pedestrian_emergency
-            self.executed_action = self.EMERGENCY_STOP
+            if target_speed <= 0.0:
+                self.executed_action = self.EMERGENCY_STOP
+                self.behavior = "ML_EMERGENCY_STOP"
+            else:
+                self.executed_action = self.DECELERATE
+                self.behavior = "ML_BRAKING_FOR_PEDESTRIAN"
             self.override_reason = reason
-            self.behavior = "ML_EMERGENCY_STOP"
             self.last_target_speed = target_speed
             return target_speed, self.target_lane_x, self.behavior
 
@@ -139,11 +143,49 @@ class RoadWeaveMLController:
             self.behavior = "ML_LANE_CHANGE"
             return self.last_target_speed, self.target_lane_x, self.behavior
 
+        if simulation_time + 1e-9 >= self.next_decision_time:
+            self._run_models()
+            self.next_decision_time = simulation_time + self.decision_interval
+            self.last_target_speed = self._execute_action(
+                ego_x,
+                ego_speed_mps,
+                sensors,
+            )
+
+        # Smoothly follow a slower vehicle ahead instead of cruising at full
+        # speed into the emergency envelope. The learned policy rarely requests
+        # a follow, so this deterministic cap mirrors the rule controller's
+        # FOLLOWING state and removes the cruise-then-hard-brake jerk.
+        self.last_target_speed = self._cap_for_following(
+            self.last_target_speed,
+            ego_speed_mps,
+            sensors,
+        )
+
+        # Deterministic overtake: a slower vehicle ahead with a clear adjacent
+        # lane. Mirrors the rule controller, which changes lane while still
+        # moving rather than parking behind the obstacle.
+        overtake = self._overtake_request(ego_x, sensors)
+        if overtake is not None:
+            target_lane_x, overtake_reason = overtake
+            self.target_lane_x = target_lane_x
+            self.executed_action = (
+                self.CHANGE_LEFT
+                if target_lane_x == self.left_lane_x
+                else self.CHANGE_RIGHT
+            )
+            self.override_reason = overtake_reason
+            self.behavior = "ML_LANE_CHANGE"
+            self.last_target_speed = min(
+                self.cruise_speed_mps,
+                max(ego_speed_mps, 8.0),
+            )
+            return self.last_target_speed, self.target_lane_x, self.behavior
+
+        # Front emergency is the safety net for cases the following/overtake
+        # path could not handle (a hard-braking or suddenly appearing actor).
         front_emergency = self._front_emergency(sensors)
         if front_emergency is not None:
-            # A full stop behind a stationary obstacle must not become a
-            # permanent deadlock. The learned policy is effectively longitudinal,
-            # so escape into a clear adjacent lane instead of waiting forever.
             escape = self._deadlock_escape(ego_x, ego_speed_mps, sensors)
             if escape is not None:
                 target_lane_x, escape_reason = escape
@@ -168,16 +210,59 @@ class RoadWeaveMLController:
             self.last_target_speed = target_speed
             return target_speed, self.target_lane_x, self.behavior
 
-        if simulation_time + 1e-9 >= self.next_decision_time:
-            self._run_models()
-            self.next_decision_time = simulation_time + self.decision_interval
-            self.last_target_speed = self._execute_action(
-                ego_x,
-                ego_speed_mps,
-                sensors,
-            )
-
         return self.last_target_speed, self.target_lane_x, self.behavior
+
+    def _cap_for_following(
+        self,
+        target_speed: float,
+        ego_speed_mps: float,
+        sensors: Any,
+    ) -> float:
+        front = getattr(sensors, "current_front", None)
+        if front is None or front.longitudinal_gap >= 50.0:
+            return target_speed
+        actor_speed = float(getattr(front.actor, "speed_mps", 0.0))
+        if actor_speed >= self.cruise_speed_mps - 0.5:
+            return target_speed
+        return min(target_speed, self._following_speed(front, ego_speed_mps))
+
+    def _following_speed(self, front: Any, ego_speed_mps: float) -> float:
+        actor_speed = float(getattr(front.actor, "speed_mps", 0.0))
+        gap = float(front.longitudinal_gap)
+        safe_gap = 7.0 + ego_speed_mps * 1.45
+        if gap <= 3.0:
+            return 0.0
+        if front.time_to_collision < 1.8:
+            return max(0.0, min(actor_speed, ego_speed_mps - 3.0))
+        gap_error = gap - safe_gap
+        return max(0.0, min(self.cruise_speed_mps, actor_speed + gap_error * 0.32))
+
+    def _overtake_request(
+        self,
+        ego_x: float,
+        sensors: Any,
+    ) -> Optional[Tuple[float, str]]:
+        """Return a clear adjacent lane when a slower vehicle blocks the current one.
+
+        Mirrors the rule controller's overtake: it changes lane while still
+        moving rather than following to a stop and then escaping. The learned
+        policy rarely initiates a lane change, so this deterministic trigger is
+        what actually performs the overtake.
+        """
+
+        front = getattr(sensors, "current_front", None)
+        if front is None or front.longitudinal_gap >= 50.0:
+            return None
+        actor_speed = float(getattr(front.actor, "speed_mps", 0.0))
+        if actor_speed >= self.cruise_speed_mps - 1.0:
+            return None
+
+        on_left = abs(ego_x - self.left_lane_x) < abs(ego_x - self.right_lane_x)
+        if on_left and self._lane_clear(sensors.right_front, sensors.right_rear):
+            return self.right_lane_x, "right lane is clear"
+        if not on_left and self._lane_clear(sensors.left_front, sensors.left_rear):
+            return self.left_lane_x, "left lane is clear"
+        return None
 
     def _observation(
         self,
@@ -332,9 +417,14 @@ class RoadWeaveMLController:
         if pedestrian is None:
             return None
         gap = max(0.0, float(pedestrian.longitudinal_gap))
-        stopping_gap = ego_speed * ego_speed / (2.0 * 4.8) + 5.0
-        if gap <= stopping_gap or pedestrian.time_to_collision < 2.0:
+        # Mirror the rule controller: brake smoothly as the pedestrian gets
+        # close, and hard-stop only when the remaining gap is nearly closed.
+        stop_gap = gap - 5.0
+        if stop_gap <= 1.5:
             return 0.0, "pedestrian emergency envelope"
+        target = min(self.cruise_speed_mps, max(0.0, stop_gap * 0.42))
+        if target < ego_speed - 0.1:
+            return target, "braking for pedestrian"
         return None
 
     def _front_emergency(

@@ -94,10 +94,28 @@ class OnlineSafetyTests(unittest.TestCase):
             cruise_speed_mps=13.9,
         )
 
-    def test_pedestrian_emergency_overrides_acceleration_model(self):
+    def test_pedestrian_hazard_overrides_acceleration_model(self):
         controller = self.controller("ACCELERATE")
         sensors = empty_sensors()
         sensors.pedestrian_hazard = hit(12.0, 10.0, ttc=1.2)
+        target_speed, _, behavior = controller.decide(
+            0.0,
+            0.0,
+            10.0,
+            sensors,
+            {},
+            simulation_time=1.0,
+        )
+        # A pedestrian that is still several metres away triggers smooth braking
+        # rather than a hard stop from distance.
+        self.assertLess(target_speed, 10.0)
+        self.assertEqual(controller.executed_action, "DECELERATE")
+        self.assertIn("BRAKING_FOR_PEDESTRIAN", behavior)
+
+    def test_close_pedestrian_triggers_emergency_stop(self):
+        controller = self.controller("ACCELERATE")
+        sensors = empty_sensors()
+        sensors.pedestrian_hazard = hit(5.0, 10.0, ttc=0.5)
         target_speed, _, behavior = controller.decide(
             0.0,
             0.0,
@@ -148,7 +166,7 @@ class OnlineSafetyTests(unittest.TestCase):
         self.assertGreater(target_speed, 0.0)
         self.assertEqual(behavior, "ML_LANE_CHANGE")
 
-    def test_stationary_deadlock_does_not_escape_moving_obstacle(self):
+    def test_moving_obstacle_is_overtaken_not_emergency_stopped(self):
         controller = self.controller("KEEP")
         sensors = empty_sensors()
         sensors.current_front = hit(4.0, 2.0, actor_speed=5.0, ttc=1.0)
@@ -160,9 +178,11 @@ class OnlineSafetyTests(unittest.TestCase):
             {},
             simulation_time=1.0,
         )
-        self.assertEqual(controller.executed_action, "EMERGENCY_STOP")
-        self.assertEqual(target_speed, 0.0)
-        self.assertEqual(target_lane, 0.0)
+        # A slow moving vehicle with a clear adjacent lane is overtaken, not
+        # treated as a stationary deadlock or a hard emergency.
+        self.assertEqual(controller.executed_action, "CHANGE_LEFT")
+        self.assertEqual(target_lane, -5.5)
+        self.assertGreater(target_speed, 0.0)
 
 
 if __name__ == "__main__":
