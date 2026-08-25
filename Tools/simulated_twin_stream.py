@@ -47,6 +47,13 @@ LEFT_SIDEWALK_X = -7.2
 EGO_WIDTH_METERS = 1.9
 EGO_LENGTH_METERS = 4.6
 CRUISE_SPEED_MPS = 13.9
+# Comfort-tuned longitudinal control. The controller may command a step target
+# at its own decision rate (5 Hz for the ML controller), so the commanded target
+# is slewed before the speed follows it, and braking is kept gentler than the
+# original hard 4.8 m/s^2 emergency limit.
+ACCELERATION_MPS2 = 2.0
+BRAKING_MPS2 = 3.0
+TARGET_SLEW_MPS2 = 3.0
 ROUTE_SAMPLE_SPACING_METERS = 2.0
 ROUTE_WINDOW_STEP_METERS = 200.0
 ROUTE_LOOK_BEHIND_METERS = 180.0
@@ -623,6 +630,7 @@ class SimulatedWorld:
         self.ego_yaw_rate = 0.0
         self.speed_mps = 0.0
         self.acceleration_mps2 = 0.0
+        self.smoothed_target_speed = 0.0
         self.lateral_speed_mps = 0.0
         self.battery_percent = 92.0
         self.controller = self._new_controller()
@@ -716,10 +724,21 @@ class SimulatedWorld:
 
     def _update_ego(self, delta_seconds: float, target_speed: float, target_lane_x: float) -> None:
         previous_speed = self.speed_mps
-        acceleration_limit = 2.0 if target_speed >= self.speed_mps else 4.8
+        # Slew the commanded target before following it so a 5 Hz step decision
+        # does not produce a 5 Hz throttle/brake sawtooth.
+        self.smoothed_target_speed = move_towards(
+            self.smoothed_target_speed,
+            max(0.0, target_speed),
+            TARGET_SLEW_MPS2 * delta_seconds,
+        )
+        acceleration_limit = (
+            ACCELERATION_MPS2
+            if self.smoothed_target_speed >= self.speed_mps
+            else BRAKING_MPS2
+        )
         self.speed_mps = move_towards(
             self.speed_mps,
-            max(0.0, target_speed),
+            self.smoothed_target_speed,
             acceleration_limit * delta_seconds,
         )
         self.acceleration_mps2 = (self.speed_mps - previous_speed) / delta_seconds
@@ -778,7 +797,7 @@ class SimulatedWorld:
                         self.speed_mps,
                         actor.speed_mps if not actor.is_pedestrian else 0.0,
                     )
-                    self.acceleration_mps2 = min(self.acceleration_mps2, -4.8)
+                    self.acceleration_mps2 = min(self.acceleration_mps2, -BRAKING_MPS2)
             elif not actor.is_pedestrian:
                 # Surrounding traffic also behaves safely. If the ego brakes
                 # for a new hazard, a vehicle approaching from behind must not
@@ -803,8 +822,8 @@ class SimulatedWorld:
         wheel_radius = 0.34
         wheel_rpm = self.speed_mps / (2.0 * math.pi * wheel_radius) * 60.0
         speed_kmh = self.speed_mps * 3.6
-        throttle = clamp(self.acceleration_mps2 / 2.0, 0.0, 1.0) * 100.0
-        brake = clamp(-self.acceleration_mps2 / 4.8, 0.0, 1.0)
+        throttle = clamp(self.acceleration_mps2 / ACCELERATION_MPS2, 0.0, 1.0) * 100.0
+        brake = clamp(-self.acceleration_mps2 / BRAKING_MPS2, 0.0, 1.0)
         ego_pose = self.road.pose(self.ego_z, self.ego_x)
         ego_yaw = ego_pose.yaw_degrees + self.ego_heading_offset_degrees
 

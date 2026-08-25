@@ -275,7 +275,12 @@ public class AutonomousTestVehicleController : MonoBehaviour
         float desiredSpeedMps = unrestrictedSpeedMps * speedFactor * weatherCruisingFactor;
         VehicleDecelerationReason requestedReason = GetEnvironmentDecelerationReason();
 
-        if (activeMlDecision != null)
+        // The learned speed target is advisory during cruise/following only.
+        // During an active overtake the rule state machine owns the speed, and
+        // the ML would otherwise keep braking for the vehicle being passed
+        // (still "in front" until the lane change completes) and stop the
+        // overtake.
+        if (activeMlDecision != null && overtakePhase == OvertakePhase.None)
         {
             float modelTarget = Mathf.Max(0f, activeMlDecision.targetSpeedMps);
             if (modelTarget < desiredSpeedMps - 0.05f)
