@@ -131,6 +131,39 @@ class OnlineSafetyTests(unittest.TestCase):
         self.assertEqual(controller.executed_action, "DECELERATE")
         self.assertEqual(behavior, "ML_LANE_CHANGE_REJECTED")
 
+    def test_stopped_behind_stationary_vehicle_escapes_into_clear_lane(self):
+        controller = self.controller("KEEP")
+        sensors = empty_sensors()
+        sensors.current_front = hit(4.0, 0.0, actor_speed=0.0, ttc=1.0)
+        target_speed, target_lane, behavior = controller.decide(
+            0.0,
+            0.0,
+            0.0,
+            sensors,
+            {},
+            simulation_time=1.0,
+        )
+        self.assertEqual(target_lane, -5.5)
+        self.assertEqual(controller.executed_action, "CHANGE_LEFT")
+        self.assertGreater(target_speed, 0.0)
+        self.assertEqual(behavior, "ML_LANE_CHANGE")
+
+    def test_stationary_deadlock_does_not_escape_moving_obstacle(self):
+        controller = self.controller("KEEP")
+        sensors = empty_sensors()
+        sensors.current_front = hit(4.0, 2.0, actor_speed=5.0, ttc=1.0)
+        target_speed, target_lane, behavior = controller.decide(
+            0.0,
+            0.0,
+            0.0,
+            sensors,
+            {},
+            simulation_time=1.0,
+        )
+        self.assertEqual(controller.executed_action, "EMERGENCY_STOP")
+        self.assertEqual(target_speed, 0.0)
+        self.assertEqual(target_lane, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

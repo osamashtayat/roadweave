@@ -105,6 +105,37 @@ new controller and clears its three-second history. Emergency pedestrian/front
 object braking, lane-clearance rejection, and three-vote lane-change
 confirmation remain deterministic safety constraints.
 
+## Run the ML models in the Test Lab
+
+The Test Lab uses a separate local UDP inference service so the same two models
+can influence the autonomous test vehicle without coupling Unity to Python.
+Start it before pressing Create Test / Run Test:
+
+```bash
+cd /Users/asus/Desktop/roadweave
+source ML/.venv/bin/activate
+python Tools/test_lab_ml_service.py
+```
+
+The service listens on `127.0.0.1:5075` (override with `--host`/`--port`) and
+answers the versioned `roadweave.testlab-ml/1.0` protocol. While it runs, the
+Test Lab's `TestLabMlDecisionBridge` requests a decision at 5 Hz and feeds the
+returned target speed (and a requested lane change) into
+`AutonomousTestVehicleController`. If the service is not running, the Test Lab
+keeps driving on its deterministic rule fallback, so a missing service never
+blocks a test.
+
+Validate the service without Unity:
+
+```bash
+python Tools/test_lab_ml_service.py --self-test
+```
+
+As in the live twin, the learned maneuver never writes a transform: it is
+supervised by the same deterministic safety envelope (pedestrian/front
+emergency braking, lane-clearance rejection, and three-vote lane-change
+confirmation).
+
 ## Outputs from the completed run
 
 Prepared data, saved models, and reports are generated locally under:

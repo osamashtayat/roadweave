@@ -121,20 +121,52 @@ class RoadWeaveMLController:
         while len(self.history) > 1 and self.history[0]["timestamp"] < cutoff:
             self.history.popleft()
 
-        emergency = self._emergency_override(ego_speed_mps, sensors)
-        if emergency is not None:
-            target_speed, reason = emergency
+        # A pedestrian hazard always wins, even over a lane change in progress.
+        pedestrian_emergency = self._pedestrian_emergency(ego_speed_mps, sensors)
+        if pedestrian_emergency is not None:
+            target_speed, reason = pedestrian_emergency
             self.executed_action = self.EMERGENCY_STOP
             self.override_reason = reason
             self.behavior = "ML_EMERGENCY_STOP"
             self.last_target_speed = target_speed
             return target_speed, self.target_lane_x, self.behavior
 
-        # Finish an accepted lane change smoothly before accepting an opposing
-        # request. Emergency checks above still run on every physics update.
+        # Finish an accepted lane change before re-evaluating the front envelope,
+        # mirroring the rule controller's overtake state machine. Without this,
+        # the vehicle being overtaken re-triggers the front brake and cancels the
+        # maneuver.
         if abs(ego_x - self.target_lane_x) > 0.18:
             self.behavior = "ML_LANE_CHANGE"
             return self.last_target_speed, self.target_lane_x, self.behavior
+
+        front_emergency = self._front_emergency(sensors)
+        if front_emergency is not None:
+            # A full stop behind a stationary obstacle must not become a
+            # permanent deadlock. The learned policy is effectively longitudinal,
+            # so escape into a clear adjacent lane instead of waiting forever.
+            escape = self._deadlock_escape(ego_x, ego_speed_mps, sensors)
+            if escape is not None:
+                target_lane_x, escape_reason = escape
+                self.target_lane_x = target_lane_x
+                self.executed_action = (
+                    self.CHANGE_LEFT
+                    if target_lane_x == self.left_lane_x
+                    else self.CHANGE_RIGHT
+                )
+                self.override_reason = escape_reason
+                self.behavior = "ML_LANE_CHANGE"
+                self.last_target_speed = min(
+                    self.cruise_speed_mps,
+                    max(ego_speed_mps, 8.0),
+                )
+                return self.last_target_speed, self.target_lane_x, self.behavior
+
+            target_speed, reason = front_emergency
+            self.executed_action = self.EMERGENCY_STOP
+            self.override_reason = reason
+            self.behavior = "ML_EMERGENCY_STOP"
+            self.last_target_speed = target_speed
+            return target_speed, self.target_lane_x, self.behavior
 
         if simulation_time + 1e-9 >= self.next_decision_time:
             self._run_models()
@@ -291,24 +323,65 @@ class RoadWeaveMLController:
         )
         return self.cruise_speed_mps
 
-    def _emergency_override(
+    def _pedestrian_emergency(
         self,
         ego_speed: float,
         sensors: Any,
     ) -> Optional[Tuple[float, str]]:
         pedestrian = getattr(sensors, "pedestrian_hazard", None)
-        if pedestrian is not None:
-            gap = max(0.0, float(pedestrian.longitudinal_gap))
-            stopping_gap = ego_speed * ego_speed / (2.0 * 4.8) + 5.0
-            if gap <= stopping_gap or pedestrian.time_to_collision < 2.0:
-                return 0.0, "pedestrian emergency envelope"
+        if pedestrian is None:
+            return None
+        gap = max(0.0, float(pedestrian.longitudinal_gap))
+        stopping_gap = ego_speed * ego_speed / (2.0 * 4.8) + 5.0
+        if gap <= stopping_gap or pedestrian.time_to_collision < 2.0:
+            return 0.0, "pedestrian emergency envelope"
+        return None
+
+    def _front_emergency(
+        self,
+        sensors: Any,
+    ) -> Optional[Tuple[float, str]]:
+        front = getattr(sensors, "current_front", None)
+        if front is None:
+            return None
+        closing_speed = max(0.0, float(front.relative_speed_mps))
+        stopping_gap = closing_speed * closing_speed / (2.0 * 4.8) + 2.5
+        if (
+            front.longitudinal_gap <= max(4.0, stopping_gap)
+            or front.time_to_collision < 1.5
+        ):
+            return 0.0, "front-object emergency envelope"
+        return None
+
+    def _deadlock_escape(
+        self,
+        ego_x: float,
+        ego_speed_mps: float,
+        sensors: Any,
+    ) -> Optional[Tuple[float, str]]:
+        """Return a clear adjacent lane when fully stopped behind a stationary actor.
+
+        The learned policy is effectively longitudinal: with only a handful of
+        lane-change training labels it almost never requests CHANGE_LEFT or
+        CHANGE_RIGHT. Without this deterministic escape the vehicle would brake
+        to a stop and wait forever behind a parked or broken-down actor. It is
+        gated on a full stop and a stationary obstacle so it never turns an
+        active braking situation into an unsafe high-speed lane change.
+        """
+        if ego_speed_mps > 0.25:
+            return None
 
         front = getattr(sensors, "current_front", None)
-        if front is not None:
-            closing_speed = max(0.0, float(front.relative_speed_mps))
-            stopping_gap = closing_speed * closing_speed / (2.0 * 4.8) + 2.5
-            if front.longitudinal_gap <= max(4.0, stopping_gap) or front.time_to_collision < 1.5:
-                return 0.0, "front-object emergency envelope"
+        if front is None:
+            return None
+        if float(getattr(front.actor, "speed_mps", 0.0)) > 1.0:
+            return None
+
+        on_left = abs(ego_x - self.left_lane_x) < abs(ego_x - self.right_lane_x)
+        if on_left and self._lane_clear(sensors.right_front, sensors.right_rear):
+            return self.right_lane_x, "right lane is clear"
+        if not on_left and self._lane_clear(sensors.left_front, sensors.left_rear):
+            return self.left_lane_x, "left lane is clear"
         return None
 
     @staticmethod
