@@ -14,12 +14,19 @@ public class TestLabSafetyTests
             "\"weatherContext\":\"Fog\",\"weatherModelUsed\":true," +
             "\"weatherSpeedFactor\":0.41,\"weatherTargetSpeedMps\":5.7}";
 
-        TestLabMlDecision decision = JsonUtility.FromJson<TestLabMlDecision>(json);
+        Type decisionType = FindRuntimeType("TestLabMlDecision");
+        object decision = JsonUtility.FromJson(json, decisionType);
 
-        Assert.That(decision.weatherModelUsed, Is.True);
-        Assert.That(decision.weatherContext, Is.EqualTo("Fog"));
-        Assert.That(decision.weatherSpeedFactor, Is.EqualTo(0.41f).Within(0.001f));
-        Assert.That(decision.weatherTargetSpeedMps, Is.EqualTo(5.7f).Within(0.001f));
+        Assert.That((bool)decisionType.GetField("weatherModelUsed").GetValue(decision), Is.True);
+        Assert.That((string)decisionType.GetField("weatherContext").GetValue(decision), Is.EqualTo("Fog"));
+        Assert.That(
+            (float)decisionType.GetField("weatherSpeedFactor").GetValue(decision),
+            Is.EqualTo(0.41f).Within(0.001f)
+        );
+        Assert.That(
+            (float)decisionType.GetField("weatherTargetSpeedMps").GetValue(decision),
+            Is.EqualTo(5.7f).Within(0.001f)
+        );
     }
 
     [Test]
