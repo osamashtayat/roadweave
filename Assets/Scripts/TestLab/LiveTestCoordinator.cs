@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using TMPro;
 using UnityEngine;
+using UnityEngine.UI;
 
 public class LiveTestCoordinator : MonoBehaviour
 {
@@ -44,6 +45,28 @@ public class LiveTestCoordinator : MonoBehaviour
     private bool sourceWasPausedByTest;
     private bool replayActorsWereVisible = true;
     private ITestWorldRouteProvider activeRouteProvider;
+    private Button runtimeRiskDrivingButton;
+    private TMP_Text runtimeRiskDrivingButtonLabel;
+
+    private void Update()
+    {
+        if (!IsInTestLab || TestVehicle == null || !TestVehicle.IsRiskDrivingActive)
+            return;
+
+        if (TestVehicle.IsMlRiskTakeoverActive)
+        {
+            SetRiskButtonLabel("RISK: ML");
+            UpdateModeLabel("TEST LAB — ML SAFETY TAKEOVER");
+        }
+        else
+        {
+            SetRiskButtonLabel("RISK: DRIVER");
+            UpdateModeLabel(
+                $"TEST LAB — RECKLESS DRIVER {TestVehicle.CurrentSpeedKph:F0} / " +
+                $"{TestVehicle.CurrentDriverRequestedSpeedKph:F0} KM/H"
+            );
+        }
+    }
 
     private void Awake()
     {
@@ -77,8 +100,16 @@ public class LiveTestCoordinator : MonoBehaviour
         }
     }
 
+    private void OnEnable()
+    {
+        // Runtime-only UI installation keeps the saved Canvas untouched and
+        // also survives Unity play-mode/domain reload ordering.
+        EnsureRuntimeRiskDrivingButton();
+    }
+
     private void Start()
     {
+        EnsureRuntimeRiskDrivingButton();
         ShowLiveTwin(false);
     }
 
@@ -122,6 +153,25 @@ public class LiveTestCoordinator : MonoBehaviour
         UpdateModeLabel("TEST LAB — RUNNING");
     }
 
+    public void StartRiskDriving()
+    {
+        if (TestVehicle == null)
+        {
+            Debug.LogWarning("Press Create Test before Risk Driving.");
+            return;
+        }
+
+        TestVehicle.SetRiskDriving(true);
+        if (metricsRecorder != null && !metricsRecorder.IsRecording)
+        {
+            string weather = weatherController != null ? weatherController.CurrentWeather.ToString() : "Dry";
+            metricsRecorder.BeginRecording("Risky Driver — ML Takeover", weather);
+        }
+        TestVehicle.SetRunning(true);
+        SetRiskButtonLabel("RISK: DRIVER");
+        UpdateModeLabel("TEST LAB — RECKLESS DRIVER (ML OBSERVING)");
+    }
+
     public void PauseTest()
     {
         if (TestVehicle != null)
@@ -137,6 +187,7 @@ public class LiveTestCoordinator : MonoBehaviour
             return;
         }
         BuildTestFromCapturedState();
+        SetRiskButtonLabel("RISK DRIVING");
     }
 
     public void ReturnToLiveTwin()
@@ -161,6 +212,7 @@ public class LiveTestCoordinator : MonoBehaviour
         if (testLabPanel != null) testLabPanel.SetActive(false);
 
         IsInTestLab = false;
+        SetRiskButtonLabel("RISK DRIVING");
         UpdateModeLabel("LIVE TWIN");
         ResumeActiveSourceIfNeeded();
     }
@@ -236,7 +288,67 @@ public class LiveTestCoordinator : MonoBehaviour
         if (testLabPanel != null) testLabPanel.SetActive(true);
 
         IsInTestLab = true;
+        SetRiskButtonLabel("RISK DRIVING");
         UpdateModeLabel("TEST LAB — READY");
+    }
+
+    private void EnsureRuntimeRiskDrivingButton()
+    {
+        if (runtimeRiskDrivingButton != null || testLabPanel == null)
+            return;
+
+        Button template = null;
+        Button[] candidates = testLabPanel.GetComponentsInChildren<Button>(true);
+        for (int index = 0; index < candidates.Length; index++)
+        {
+            if (candidates[index] == null)
+                continue;
+            if (candidates[index].name == "RiskDrivingButton_Runtime")
+            {
+                runtimeRiskDrivingButton = candidates[index];
+                runtimeRiskDrivingButtonLabel = candidates[index].GetComponentInChildren<TMP_Text>(true);
+                runtimeRiskDrivingButton.onClick = new Button.ButtonClickedEvent();
+                runtimeRiskDrivingButton.onClick.AddListener(StartRiskDriving);
+                SetRiskButtonLabel("RISK DRIVING");
+                return;
+            }
+            if (candidates[index].name == "RunTestButton")
+            {
+                template = candidates[index];
+            }
+        }
+
+        if (template == null)
+        {
+            Debug.LogWarning("Risk Driving button could not be created because RunTestButton was not found.");
+            return;
+        }
+
+        GameObject buttonObject = Instantiate(template.gameObject, template.transform.parent);
+        buttonObject.name = "RiskDrivingButton_Runtime";
+        buttonObject.SetActive(true);
+        runtimeRiskDrivingButton = buttonObject.GetComponent<Button>();
+        runtimeRiskDrivingButton.onClick = new Button.ButtonClickedEvent();
+        runtimeRiskDrivingButton.onClick.AddListener(StartRiskDriving);
+
+        RectTransform rect = buttonObject.GetComponent<RectTransform>();
+        RectTransform templateRect = template.GetComponent<RectTransform>();
+        if (rect != null && templateRect != null)
+            rect.anchoredPosition = templateRect.anchoredPosition + new Vector2(180f, 0f);
+
+        runtimeRiskDrivingButtonLabel = buttonObject.GetComponentInChildren<TMP_Text>(true);
+        SetRiskButtonLabel("RISK DRIVING");
+
+        ColorBlock colors = runtimeRiskDrivingButton.colors;
+        colors.normalColor = new Color(1f, 0.72f, 0.28f, 1f);
+        colors.highlightedColor = new Color(1f, 0.82f, 0.45f, 1f);
+        runtimeRiskDrivingButton.colors = colors;
+    }
+
+    private void SetRiskButtonLabel(string label)
+    {
+        if (runtimeRiskDrivingButtonLabel != null)
+            runtimeRiskDrivingButtonLabel.text = label;
     }
 
     private bool TryBuildRemainingWorldRoute(out List<Vector3> route, out string failure)

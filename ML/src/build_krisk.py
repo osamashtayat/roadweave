@@ -725,15 +725,18 @@ def detect_lane_change(
 ) -> Optional[str]:
     """Return CHANGE_LEFT/CHANGE_RIGHT when the ego makes a lateral maneuver.
 
-    highD carries explicit per-frame ``yaw_left``/``yaw_right`` flags, which are
-    ground-truth lateral-movement signals (not a heuristic). They describe the
-    driver's actual maneuver, so they are used only to add the otherwise nearly
-    absent lane-change policy examples. CitySim's threshold-based turn labels
-    are intentionally ignored because the release documents them as coarse and,
-    in FreewayB, permissive.
+    highD carries explicit per-frame ``yaw_left``/``yaw_right`` signals and a
+    clip-level ``lane_diff`` flag.  A yaw signal alone is only notable lateral
+    movement, so require ``lane_diff`` before using its direction as a completed
+    lane-change policy label. CitySim's threshold-based turn labels are
+    intentionally ignored because the release documents them as coarse and, in
+    FreewayB, permissive.
     """
 
     if schema != "highd":
+        return None
+
+    if not any(bool(record.get("lane_diff")) for record in ego_records):
         return None
 
     frame_field = str(fields["frame"])
@@ -1088,6 +1091,8 @@ def run_conversion(arguments: argparse.Namespace) -> Dict[str, object]:
 
     risk_rows: List[Dict[str, object]] = []
     policy_rows: List[Dict[str, object]] = []
+    native_lane_change_rows = 0
+    gpt_policy_rows_matched = 0
     errors: List[str] = list(gpt_errors)
     source_counts = Counter()
     severity_counts = Counter()
@@ -1109,6 +1114,7 @@ def run_conversion(arguments: argparse.Namespace) -> Dict[str, object]:
                 lane_row = dict(risk_row)
                 lane_row["target"] = lane_change
                 policy_rows.append(lane_row)
+                native_lane_change_rows += 1
 
             action_id = gpt_actions.get(str(candidate["stem"]))
             if action_id is not None:
@@ -1123,6 +1129,7 @@ def run_conversion(arguments: argparse.Namespace) -> Dict[str, object]:
                     policy_row = dict(risk_row)
                     policy_row["target"] = ACTION_NAMES[action]
                     policy_rows.append(policy_row)
+                    gpt_policy_rows_matched += 1
         except Exception as error:  # Continue so one corrupt event is reportable.
             errors.append("{0}: {1}".format(candidate["path"], error))
 
@@ -1170,7 +1177,9 @@ def run_conversion(arguments: argparse.Namespace) -> Dict[str, object]:
         "converted_by_source": dict(source_counts),
         "converted_by_severity": dict(severity_counts),
         "gpt_responses_found": len(gpt_actions),
-        "gpt_responses_matched": len(policy_rows),
+        "gpt_responses_matched": gpt_policy_rows_matched,
+        "native_lane_change_rows": native_lane_change_rows,
+        "policy_rows_total": len(policy_rows),
         "history": {
             "minimum_frames": min(history_frames) if history_frames else 0,
             "maximum_frames": max(history_frames) if history_frames else 0,

@@ -35,18 +35,72 @@ optimistic evidence.
 ## Policy model
 
 - Model: histogram gradient-boosting classifier
-- Rows: 13,447
-- Classes: KEEP 11,889; ACCELERATE 658; DECELERATE 632; CHANGE_LEFT 150;
-  CHANGE_RIGHT 118
-- Test macro-F1: 0.7582
-- Per-class test F1: KEEP 0.956; ACCELERATE 0.519; DECELERATE 0.597;
-  CHANGE_LEFT 0.862; CHANGE_RIGHT 0.857
+- Rows: 13,426
+- Classes: KEEP 11,889; ACCELERATE 658; DECELERATE 632; CHANGE_LEFT 136;
+  CHANGE_RIGHT 111
+- Test accuracy: 0.9206
+- Test macro-F1: 0.7612
+- Per-class test F1: KEEP 0.957; ACCELERATE 0.566; DECELERATE 0.531;
+  CHANGE_LEFT 0.906; CHANGE_RIGHT 0.846
+- Leave-one-source-out macro-F1: 0.1426 (train nuScenes → test K-Risk),
+  0.2023 (train K-Risk → test nuScenes)
 
-Lane changes are now learnable. Two fixes supplied the previously missing
-signal: highD's native `yaw_left`/`yaw_right` ground-truth flags are used as
-policy labels (150+118 examples instead of 12), and nuScenes lane changes are
-detected by integrating lateral motion per frame heading (curvature-invariant)
-over a 3 s window. Lane-change F1 went from 0.0 to ~0.86.
+Lane changes are now learnable. highD contributes direction only when its
+native `yaw_left`/`yaw_right` signal is paired with a true clip-level
+`lane_diff`; nuScenes lane changes are detected by integrating lateral motion
+per frame heading (curvature-invariant) over a 3 s window. This avoids treating
+21 notable lateral movements as completed lane changes while preserving strong
+held-out lane-change scores.
+
+The policy score is still within-domain evidence. Its leave-one-source-out
+results remain weak, so it must not be described as a source-independent or
+real-vehicle-ready controller.
+
+## Controller benchmark
+
+The original six-seed, 150-second benchmark found the ML controller more
+conservative than the deterministic controller. After the lane-label cleanup,
+a two-seed, 90-second regression run confirmed the same direction: rule/ML
+progress was 716/641 m, minimum TTC 1.352/1.394 s, emergency stops 2/2,
+deadlock time 1.85/3.55 s, and mean absolute acceleration 1.027/1.089 m/s².
+This shorter post-clean run is a regression check, not a replacement for a
+larger statistical evaluation.
+
+## Weather-speed model
+
+- Model: histogram gradient-boosting regressor
+- Dataset: Extreme Driving Conditions Dataset
+- Conditions: `DRY`, `RAIN`, `SNOW`, `FOG`
+- Converted rows: 18,787 from 413 unique episodes
+- Training rows/groups: 16,869 / 379
+- Official validation rows/groups: 1,918 / 34
+- Inputs: 16 summaries of the previous three seconds of longitudinal
+  acceleration and yaw rate, plus one-hot weather context
+- Output: a continuous cruise-speed factor clipped to 0.35–1.0
+- Five-fold, episode-separated CV MAE: 0.1263 (fixed rules: 0.2106)
+- Official validation MAE: 0.1401 (fixed rules: 0.1843)
+- Official validation R²: 0.2033
+
+The target is the following second's mean vehicle speed divided by a 50 km/h
+reference. Current-speed features are intentionally excluded: including them
+made future-speed prediction a nearly identical copy of the present speed and
+produced a misleadingly small error. Condition-balanced sample weights prevent
+the numerous fog frames from completely overwhelming rain and snow.
+
+Fog is included because the episode annotations contain explicit fog/haze
+descriptions. The converter found 14,236 fog rows, 1,528 rain rows, 262 snow
+rows, and 2,761 dry rows across train and validation. The official validation
+split is highly uneven (fog 1,765, dry 124, rain 15, snow 14), so the aggregate
+score is useful but the rain and snow condition scores are not yet strong
+evidence of generalization. Additional episode-level validation is required
+before making safety claims.
+
+At runtime the weather model is a cautious speed-cap advisor. It does not steer,
+brake directly, classify risk, or replace the deterministic collision envelope.
+Unity forces dry weather to factor 1.0, smooths adverse factor changes, and uses
+the former fixed rain/snow/fog percentages only when the model service is absent
+or stale. This dataset has no ground-truth sensor-health label, so this model
+must not be described as measuring camera, LiDAR, radar, GPS, or IMU reliability.
 
 ## Online safety behavior
 
@@ -66,9 +120,9 @@ simulated vehicle:
 
 ## Required next research work
 
-1. Evaluate cross-domain generalization and calibration; the ~0.08
-   leave-one-source-out scores show the domain gap is not closed by labeling
-   alone.
+1. Improve cross-domain generalization and calibration; the risk model's ~0.08
+   and policy model's ~0.14–0.20 leave-one-source-out scores show that labeling
+   alone does not close the domain gap.
 2. Add an NGSIM adapter with an explicit feet→metres unit conversion. Its
    K-Risk release retains native feet despite the `info.txt` labelling them as
    metres, so it needs a separately verified unit test before use.

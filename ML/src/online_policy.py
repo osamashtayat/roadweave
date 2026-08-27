@@ -9,6 +9,7 @@ collision checks.
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Deque, Dict, Mapping, Optional, Tuple
@@ -55,6 +56,7 @@ class RoadWeaveMLController:
         decision_rate_hz: float = 5.0,
         history_seconds: float = 3.0,
         confidence_threshold: float = 0.45,
+        asynchronous_inference: bool = False,
     ) -> None:
         if decision_rate_hz <= 0.0:
             raise ValueError("decision_rate_hz must be greater than zero.")
@@ -68,6 +70,13 @@ class RoadWeaveMLController:
         self.decision_interval = 1.0 / decision_rate_hz
         self.history_seconds = history_seconds
         self.confidence_threshold = confidence_threshold
+        self.asynchronous_inference = asynchronous_inference
+        self._inference_executor: Optional[ThreadPoolExecutor] = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="roadweave-ml")
+            if asynchronous_inference
+            else None
+        )
+        self._pending_prediction: Optional[Future] = None
 
         self.behavior = "ML_KEEP"
         self.target_lane_x = right_lane_x
@@ -80,7 +89,7 @@ class RoadWeaveMLController:
         self.risk_level = "LOW"
         self.risk_confidence = 0.0
         self.override_reason = ""
-        self.last_target_speed = 0.0
+        self.last_target_speed = cruise_speed_mps
         self.pending_lane_action: Optional[str] = None
         self.pending_lane_votes = 0
 
@@ -143,9 +152,7 @@ class RoadWeaveMLController:
             self.behavior = "ML_LANE_CHANGE"
             return self.last_target_speed, self.target_lane_x, self.behavior
 
-        if simulation_time + 1e-9 >= self.next_decision_time:
-            self._run_models()
-            self.next_decision_time = simulation_time + self.decision_interval
+        if self._update_model_decision(simulation_time):
             self.last_target_speed = self._execute_action(
                 ego_x,
                 ego_speed_mps,
@@ -324,10 +331,67 @@ class RoadWeaveMLController:
         )
         return state
 
-    def _run_models(self) -> None:
-        summary = summarize_history(self.history)
+    def close(self) -> None:
+        """Release the optional background inference worker."""
+
+        if self._pending_prediction is not None:
+            self._pending_prediction.cancel()
+            self._pending_prediction = None
+        if self._inference_executor is not None:
+            self._inference_executor.shutdown(wait=False, cancel_futures=True)
+            self._inference_executor = None
+
+    def _update_model_decision(self, simulation_time: float) -> bool:
+        """Poll/launch inference without delaying the 30 Hz motion loop.
+
+        Scikit-learn prediction takes about 80-110 ms on the development Mac.
+        Running it inline five times per second therefore starved the UDP
+        publisher and produced the visible hold/catch-up bounce in Unity.
+        """
+
+        updated = False
+        if self._pending_prediction is not None and self._pending_prediction.done():
+            try:
+                self._apply_model_output(self._pending_prediction.result())
+            except Exception as error:  # Keep deterministic safety available.
+                self.requested_action = self.KEEP
+                self.executed_action = self.DECELERATE
+                self.override_reason = "ML inference failed: {}".format(error)
+            self._pending_prediction = None
+            updated = True
+
+        if (
+            simulation_time + 1e-9 >= self.next_decision_time
+            and self._pending_prediction is None
+        ):
+            summary = summarize_history(self.history)
+            self.next_decision_time = simulation_time + self.decision_interval
+            if self._inference_executor is None:
+                self._apply_model_output(self._predict_summary(summary))
+                updated = True
+            else:
+                self._pending_prediction = self._inference_executor.submit(
+                    self._predict_summary,
+                    summary,
+                )
+        return updated
+
+    def _predict_summary(self, summary: Mapping[str, float]) -> Tuple[str, float, str, float]:
         risk, risk_confidence, _ = predict_one(self.models.risk, summary)
         action, action_confidence, _ = predict_one(self.models.policy, summary)
+        return risk, risk_confidence, action, action_confidence
+
+    def _run_models(self) -> None:
+        """Synchronous path retained for unit tests and offline benchmarks."""
+
+        summary = summarize_history(self.history)
+        self._apply_model_output(self._predict_summary(summary))
+
+    def _apply_model_output(
+        self,
+        prediction: Tuple[str, float, str, float],
+    ) -> None:
+        risk, risk_confidence, action, action_confidence = prediction
         self.risk_level = risk
         self.risk_confidence = risk_confidence
         self.requested_action = action
@@ -381,7 +445,7 @@ class RoadWeaveMLController:
         if action == self.ACCELERATE:
             return min(self.cruise_speed_mps, ego_speed + 2.0)
         if action == self.DECELERATE:
-            return max(0.0, ego_speed - 3.0)
+            return self._cautious_speed(ego_speed)
         if action == self.CHANGE_LEFT:
             if self._lane_clear(sensors.left_front, sensors.left_rear):
                 self.target_lane_x = self.left_lane_x
@@ -389,7 +453,7 @@ class RoadWeaveMLController:
             self.executed_action = self.DECELERATE
             self.override_reason = "left lane is not clear"
             self.behavior = "ML_LANE_CHANGE_REJECTED"
-            return max(0.0, ego_speed - 3.0)
+            return self._cautious_speed(ego_speed)
         if action == self.CHANGE_RIGHT:
             if self._lane_clear(sensors.right_front, sensors.right_rear):
                 self.target_lane_x = self.right_lane_x
@@ -397,7 +461,7 @@ class RoadWeaveMLController:
             self.executed_action = self.DECELERATE
             self.override_reason = "right lane is not clear"
             self.behavior = "ML_LANE_CHANGE_REJECTED"
-            return max(0.0, ego_speed - 3.0)
+            return self._cautious_speed(ego_speed)
 
         # KEEP means lane keeping at the normal route speed, not freezing the
         # current transform or forcing the speed to zero.
@@ -407,6 +471,12 @@ class RoadWeaveMLController:
             else self.right_lane_x
         )
         return self.cruise_speed_mps
+
+    def _cautious_speed(self, ego_speed: float) -> float:
+        """Reduce speed without turning a risk prediction into a full stop."""
+
+        floor = min(self.cruise_speed_mps, max(2.0, self.cruise_speed_mps * 0.55))
+        return min(self.cruise_speed_mps, max(floor, ego_speed - 1.0))
 
     def _pedestrian_emergency(
         self,

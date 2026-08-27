@@ -1,3 +1,5 @@
+using System;
+using System.Collections.Generic;
 using UnityEngine;
 
 public class EgoVehicleReplayView : MonoBehaviour
@@ -11,15 +13,26 @@ public class EgoVehicleReplayView : MonoBehaviour
     [SerializeField] private bool applyRotation = true;
 
     [Header("Streaming Presentation")]
-    [Tooltip("Replay already publishes interpolated poses. This smooths only simulated/live streams.")]
+    [Tooltip("Replay already publishes interpolated poses. Buffer only simulated/live streams.")]
     [SerializeField] private bool smoothStreamingSources = true;
-    [SerializeField, Min(0f)] private float positionSmoothness = 18f;
-    [SerializeField, Min(0f)] private float rotationSmoothness = 14f;
+    [Tooltip("Presentation delay used to interpolate between two received poses instead of chasing UDP steps.")]
+    [SerializeField, Min(0.03f)] private float streamingInterpolationDelaySeconds = 0.16f;
+    [SerializeField, Range(4, 64)] private int maximumBufferedPoses = 24;
+
+    private struct StreamingPoseSample
+    {
+        public long sequenceNumber;
+        public double sourceTimestampSeconds;
+        public double receiptTimestampSeconds;
+        public Vector3 localPosition;
+        public Quaternion localRotation;
+    }
 
     private Renderer[] presentationRenderers;
     private bool[] rendererEnabledDefaults;
+    private readonly List<StreamingPoseSample> streamingPoseBuffer =
+        new List<StreamingPoseSample>(16);
     private bool presentationAvailable = true;
-    private bool streamingPoseInitialized;
     private string presentedSessionId;
 
     private void Awake()
@@ -36,6 +49,27 @@ public class EgoVehicleReplayView : MonoBehaviour
             rendererEnabledDefaults[index] = presentationRenderers[index] != null && presentationRenderers[index].enabled;
     }
 
+    private void OnEnable()
+    {
+        if (stateManager == null)
+            stateManager = FindAnyObjectByType<DigitalTwinStateManager>();
+        if (stateManager != null)
+            stateManager.SnapshotUpdated += BufferStreamingSnapshot;
+    }
+
+    private void Start()
+    {
+        if (stateManager?.CurrentSnapshot != null)
+            BufferStreamingSnapshot(stateManager.CurrentSnapshot);
+    }
+
+    private void OnDisable()
+    {
+        if (stateManager != null)
+            stateManager.SnapshotUpdated -= BufferStreamingSnapshot;
+        ResetStreamingPresentation();
+    }
+
     private void LateUpdate()
     {
         bool available = stateManager != null && stateManager.IsReady && stateManager.IsFresh &&
@@ -44,7 +78,7 @@ public class EgoVehicleReplayView : MonoBehaviour
         SetPresentationAvailable(available);
         if (!available)
         {
-            streamingPoseInitialized = false;
+            ResetStreamingPresentation();
             return;
         }
 
@@ -59,30 +93,147 @@ public class EgoVehicleReplayView : MonoBehaviour
             stateManager.Ego.yawDegrees + modelYawOffset,
             0f);
 
-        string sessionId = metadata?.session?.sessionId;
-        bool newSession = !string.Equals(presentedSessionId, sessionId, System.StringComparison.Ordinal);
-        if (!streaming || !streamingPoseInitialized || newSession)
+        string sessionId = metadata?.session?.sessionId ?? string.Empty;
+        bool newSession = !string.Equals(presentedSessionId, sessionId, StringComparison.Ordinal);
+        if (!streaming)
         {
             if (applyPosition)
                 vehicleRoot.localPosition = targetPosition;
             if (applyRotation)
                 vehicleRoot.localRotation = targetRotation;
-            streamingPoseInitialized = streaming;
             presentedSessionId = sessionId;
             return;
         }
 
-        if (applyPosition)
+        if (newSession)
+            presentedSessionId = sessionId;
+
+        if (!TrySampleBufferedPose(
+                Time.realtimeSinceStartupAsDouble,
+                out Vector3 presentedPosition,
+                out Quaternion presentedRotation))
         {
-            float blend = ExponentialBlend(positionSmoothness, Time.deltaTime);
-            vehicleRoot.localPosition = Vector3.Lerp(vehicleRoot.localPosition, targetPosition, blend);
+            presentedPosition = targetPosition;
+            presentedRotation = targetRotation;
         }
 
+        if (applyPosition)
+            vehicleRoot.localPosition = presentedPosition;
         if (applyRotation)
+            vehicleRoot.localRotation = presentedRotation;
+        presentedSessionId = sessionId;
+    }
+
+    private void BufferStreamingSnapshot(TwinSnapshot snapshot)
+    {
+        TwinSnapshotMetadata metadata = snapshot?.metadata;
+        TwinSessionInfo session = metadata?.session;
+        TwinEgoState ego = snapshot?.ego;
+        if (metadata == null || session == null || ego == null ||
+            session.sourceKind == TwinSourceKind.Replay ||
+            metadata.freshness == TwinDataFreshness.Stale ||
+            (ego.validity != TwinDataValidity.Valid && ego.validity != TwinDataValidity.Partial))
+            return;
+
+        string sessionId = session.sessionId ?? string.Empty;
+        if (!string.Equals(presentedSessionId, sessionId, StringComparison.Ordinal))
         {
-            float blend = ExponentialBlend(rotationSmoothness, Time.deltaTime);
-            vehicleRoot.localRotation = Quaternion.Slerp(vehicleRoot.localRotation, targetRotation, blend);
+            streamingPoseBuffer.Clear();
+            presentedSessionId = sessionId;
         }
+
+        StreamingPoseSample sample = new StreamingPoseSample
+        {
+            sequenceNumber = metadata.sequenceNumber,
+            sourceTimestampSeconds = metadata.sourceTimestampSeconds,
+            receiptTimestampSeconds = metadata.receiptTimestampSeconds,
+            localPosition = ego.position + localPositionOffset,
+            localRotation = Quaternion.Euler(0f, ego.yawDegrees + modelYawOffset, 0f)
+        };
+
+        if (streamingPoseBuffer.Count > 0)
+        {
+            StreamingPoseSample last = streamingPoseBuffer[streamingPoseBuffer.Count - 1];
+            if (sample.sourceTimestampSeconds < last.sourceTimestampSeconds - 0.000001d)
+            {
+                // A restarted stream may reset both its source clock and its
+                // sequence number while retaining the same session id.
+                streamingPoseBuffer.Clear();
+            }
+            else if (sample.sequenceNumber <= last.sequenceNumber)
+            {
+                return;
+            }
+            else if (Math.Abs(sample.sourceTimestampSeconds - last.sourceTimestampSeconds) <= 0.000001d)
+            {
+                // Paused streaming sources send heartbeat snapshots with the
+                // same source time. Replace the heartbeat instead of filling
+                // the interpolation buffer with duplicate poses.
+                streamingPoseBuffer[streamingPoseBuffer.Count - 1] = sample;
+                return;
+            }
+        }
+
+        streamingPoseBuffer.Add(sample);
+        int maximum = Mathf.Clamp(maximumBufferedPoses, 4, 64);
+        while (streamingPoseBuffer.Count > maximum)
+            streamingPoseBuffer.RemoveAt(0);
+    }
+
+    private bool TrySampleBufferedPose(
+        double realtimeNow,
+        out Vector3 localPosition,
+        out Quaternion localRotation)
+    {
+        if (streamingPoseBuffer.Count == 0)
+        {
+            localPosition = default;
+            localRotation = Quaternion.identity;
+            return false;
+        }
+
+        StreamingPoseSample newest = streamingPoseBuffer[streamingPoseBuffer.Count - 1];
+        bool sourceIsRunning = stateManager?.Session?.status == TwinSessionStatus.Running;
+        double estimatedSourceNow = sourceIsRunning
+            ? newest.sourceTimestampSeconds + Math.Max(0d, realtimeNow - newest.receiptTimestampSeconds)
+            : newest.sourceTimestampSeconds;
+        double renderSourceTime = estimatedSourceNow -
+                                  Math.Max(0.03d, streamingInterpolationDelaySeconds);
+
+        while (streamingPoseBuffer.Count > 2 &&
+               streamingPoseBuffer[1].sourceTimestampSeconds <= renderSourceTime)
+            streamingPoseBuffer.RemoveAt(0);
+
+        StreamingPoseSample first = streamingPoseBuffer[0];
+        if (streamingPoseBuffer.Count == 1 || renderSourceTime <= first.sourceTimestampSeconds)
+        {
+            localPosition = first.localPosition;
+            localRotation = first.localRotation;
+            return true;
+        }
+
+        StreamingPoseSample second = streamingPoseBuffer[1];
+        float interpolation = SourceInterpolationFactor(
+            renderSourceTime,
+            first.sourceTimestampSeconds,
+            second.sourceTimestampSeconds);
+        localPosition = Vector3.LerpUnclamped(first.localPosition, second.localPosition, interpolation);
+        localRotation = Quaternion.SlerpUnclamped(first.localRotation, second.localRotation, interpolation);
+        return true;
+    }
+
+    private static float SourceInterpolationFactor(double time, double from, double to)
+    {
+        double duration = to - from;
+        if (duration <= 0.000001d)
+            return 1f;
+        return Mathf.Clamp01((float)((time - from) / duration));
+    }
+
+    private void ResetStreamingPresentation()
+    {
+        streamingPoseBuffer.Clear();
+        presentedSessionId = null;
     }
 
     private void SetPresentationAvailable(bool available)
@@ -98,10 +249,4 @@ public class EgoVehicleReplayView : MonoBehaviour
         }
     }
 
-    private static float ExponentialBlend(float smoothness, float deltaTime)
-    {
-        if (smoothness <= 0f)
-            return 1f;
-        return 1f - Mathf.Exp(-smoothness * Mathf.Max(0f, deltaTime));
-    }
 }

@@ -8,6 +8,7 @@ from pathlib import Path
 from ML.src.build_krisk import (
     canonical_response_stem,
     convert_event,
+    detect_lane_change,
     flatten_records,
     longitudinal_gap,
     normalized_id,
@@ -99,6 +100,43 @@ class KRiskConverterTests(unittest.TestCase):
                 canonical_response_stem(path),
                 "freewayB_track_4_car_895_frame_4419_to_4510",
             )
+
+    def test_highd_yaw_requires_confirmed_lane_change(self):
+        fields = record_fields("highd")
+        lateral_movement_only = [
+            {
+                "frame": 100,
+                "yaw_left": True,
+                "yaw_right": False,
+                "lane_diff": False,
+            }
+        ]
+        confirmed_change = [
+            {
+                "frame": 100,
+                "yaw_left": True,
+                "yaw_right": False,
+                "lane_diff": True,
+            }
+        ]
+
+        self.assertIsNone(
+            detect_lane_change(
+                lateral_movement_only,
+                fields,
+                peak_frame=100,
+                schema="highd",
+            )
+        )
+        self.assertEqual(
+            detect_lane_change(
+                confirmed_change,
+                fields,
+                peak_frame=100,
+                schema="highd",
+            ),
+            "CHANGE_LEFT",
+        )
 
     def test_highd_conversion_excludes_risk_and_behaviour_labels(self):
         with tempfile.TemporaryDirectory() as directory:

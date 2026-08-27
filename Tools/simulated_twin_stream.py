@@ -605,7 +605,7 @@ class SimulatedWorld:
         self.controller_factory = controller_factory
         self.reset_count = 0
         self.sensors = SimulatedSensorSuite()
-        self.controller = self._new_controller()
+        self.controller: Optional[Any] = None
         self.reset()
 
     def _new_controller(self) -> Any:
@@ -614,6 +614,12 @@ class SimulatedWorld:
         return AutonomousDrivingController()
 
     def reset(self) -> None:
+        previous_controller = self.controller
+        if previous_controller is not None:
+            close_controller = getattr(previous_controller, "close", None)
+            if callable(close_controller):
+                close_controller()
+
         self.scenario_seed = (
             secrets.randbits(32)
             if self.configured_seed is None
@@ -648,11 +654,18 @@ class SimulatedWorld:
         if self.announce:
             self._print_plan()
 
+    def close(self) -> None:
+        close_controller = getattr(self.controller, "close", None)
+        if callable(close_controller):
+            close_controller()
+
     def update(self, delta_seconds: float) -> None:
         delta_seconds = clamp(delta_seconds, 0.0, 0.1)
         if delta_seconds <= 0.0:
             return
         self.simulation_time += delta_seconds
+        previous_ego_x = self.ego_x
+        previous_ego_z = self.ego_z
         self._update_actors(delta_seconds)
         self.latest_sensors = self.sensors.observe(
             self.ego_x, self.ego_z, self.speed_mps, self.actors
@@ -668,7 +681,7 @@ class SimulatedWorld:
             ego_yaw_rate=self.ego_yaw_rate,
         )
         self._update_ego(delta_seconds, target_speed, target_lane_x)
-        self._enforce_non_penetration()
+        self._enforce_non_penetration(previous_ego_x, previous_ego_z)
         self._retire_passed_actors()
         self._ensure_future_scenarios()
         self.battery_percent = max(0.0, self.battery_percent - 0.0003 * delta_seconds)
@@ -744,11 +757,15 @@ class SimulatedWorld:
         self.acceleration_mps2 = (self.speed_mps - previous_speed) / delta_seconds
 
         lane_error = target_lane_x - self.ego_x
-        desired_lateral_speed = clamp(lane_error * 1.15, -2.15, 2.15)
+        # A lane change should read as a deliberate steering maneuver, not a
+        # sideways snap. Keep the lateral command and its acceleration below
+        # normal comfort limits while the longitudinal controller continues at
+        # 30 Hz.
+        desired_lateral_speed = clamp(lane_error * 0.82, -1.45, 1.45)
         self.lateral_speed_mps = move_towards(
             self.lateral_speed_mps,
             desired_lateral_speed,
-            2.8 * delta_seconds,
+            1.8 * delta_seconds,
         )
         if abs(lane_error) < 0.035:
             self.ego_x = target_lane_x
@@ -763,7 +780,7 @@ class SimulatedWorld:
         self.ego_heading_offset_degrees = move_towards(
             self.ego_heading_offset_degrees,
             desired_heading_offset,
-            45.0 * delta_seconds,
+            20.0 * delta_seconds,
         )
         previous_yaw = self.ego_yaw_degrees
         route_yaw = self.road.pose(self.ego_z).yaw_degrees
@@ -772,7 +789,11 @@ class SimulatedWorld:
             previous_yaw, self.ego_yaw_degrees
         ) / delta_seconds
 
-    def _enforce_non_penetration(self) -> None:
+    def _enforce_non_penetration(
+        self,
+        previous_ego_x: float,
+        previous_ego_z: float,
+    ) -> None:
         for actor in self.actors:
             if not actor.active or actor.cleared:
                 continue
@@ -792,7 +813,24 @@ class SimulatedWorld:
                 )
                 maximum_ego_z = actor.z - required_gap
                 if self.ego_z > maximum_ego_z:
-                    self.ego_z = maximum_ego_z
+                    previously_separate_laterally = (
+                        abs(previous_ego_x - actor.x) >= lateral_limit
+                    )
+                    if previously_separate_laterally and previous_ego_z <= maximum_ego_z:
+                        # The longitudinal motion was safe in the old lane; the
+                        # new lateral step alone entered an occupied envelope.
+                        # Reject that lateral step instead of visibly rewinding
+                        # the ego vehicle along the road.
+                        self.ego_x = previous_ego_x
+                        self.lateral_speed_mps = 0.0
+                        self.ego_heading_offset_degrees = 0.0
+                        self.ego_yaw_degrees = self.road.pose(self.ego_z).yaw_degrees
+                        self.ego_yaw_rate = 0.0
+                        continue
+
+                    # A longitudinal clamp may stop progress, but it must never
+                    # make an already-published streaming pose move backward.
+                    self.ego_z = max(previous_ego_z, maximum_ego_z)
                     self.speed_mps = min(
                         self.speed_mps,
                         actor.speed_mps if not actor.is_pedestrian else 0.0,
@@ -1205,6 +1243,10 @@ def main() -> None:
                 left_lane_x=LEFT_LANE_X,
                 cruise_speed_mps=CRUISE_SPEED_MPS,
                 decision_rate_hz=arguments.ml_decision_rate,
+                # A live source must keep publishing at 30 Hz even when one
+                # scikit-learn inference takes longer than a frame. Offline
+                # self-tests remain synchronous and deterministic.
+                asynchronous_inference=not arguments.self_test,
             )
 
         controller_factory = create_ml_controller
@@ -1337,6 +1379,7 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nStopping RoadWeave simulated stream.")
     finally:
+        world.close()
         data_socket.close()
         control_socket.close()
 

@@ -74,12 +74,12 @@ class GroupSplitTests(unittest.TestCase):
 
 
 class OnlineSafetyTests(unittest.TestCase):
-    def controller(self, action):
+    def controller(self, action, risk="LOW"):
         models = OnlineModelBundle(
             risk=artifact(
                 "risk",
                 ["LOW", "MODERATE", "HIGH", "EXTREME"],
-                "LOW",
+                risk,
             ),
             policy=artifact(
                 "policy",
@@ -93,6 +93,23 @@ class OnlineSafetyTests(unittest.TestCase):
             left_lane_x=-5.5,
             cruise_speed_mps=13.9,
         )
+
+    def test_extreme_risk_reduces_speed_but_does_not_stop_live_stream(self):
+        controller = self.controller("KEEP", risk="EXTREME")
+        sensors = empty_sensors()
+        speed = 10.0
+        for index in range(8):
+            speed, _, _ = controller.decide(
+                0.0,
+                0.0,
+                speed,
+                sensors,
+                {},
+                simulation_time=1.0 + index * 0.21,
+            )
+        self.assertGreaterEqual(speed, 13.9 * 0.55)
+        self.assertEqual(controller.executed_action, "DECELERATE")
+        self.assertIn("extreme-risk", controller.override_reason)
 
     def test_pedestrian_hazard_overrides_acceleration_model(self):
         controller = self.controller("ACCELERATE")

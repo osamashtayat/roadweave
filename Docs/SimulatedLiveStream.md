@@ -131,9 +131,11 @@ seed whenever a run needs to be reproduced.
 ## Unity presentation behavior
 
 `EgoVehicleReplayView` keeps the snapshot authoritative but smooths simulated
-and live-source presentation between network updates. It permits only a short,
-bounded extrapolation and stops using it when data becomes stale. nuScenes replay
-continues to use its existing replay interpolation unchanged.
+and live-source presentation with a short timestamped pose buffer. It renders
+about 100 ms behind the newest packet and interpolates only between two received
+poses; it does not invent forward motion. Paused or stale data therefore holds
+or disappears instead of drifting. nuScenes replay continues to use its existing
+replay interpolation unchanged.
 
 `ReplayActorManager` grounds cars, trucks, buses, pedestrians, bicycles,
 motorcycles, barriers, and generic road actors to the ego road plane. Imported

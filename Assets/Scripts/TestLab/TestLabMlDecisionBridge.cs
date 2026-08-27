@@ -37,6 +37,9 @@ public sealed class TestLabMlDecision
     public string overrideReason;
     public int historySamples;
     public string weatherContext;
+    public bool weatherModelUsed;
+    public float weatherSpeedFactor = 1f;
+    public float weatherTargetSpeedMps;
     public string error;
 
     public TestLabMlAction Action => ParseAction(executedAction);
@@ -103,6 +106,12 @@ public sealed class TestLabMlDecisionBridge : MonoBehaviour
                 $"ML: {latestDecision.executedAction} {latestDecision.actionConfidence:P0}, " +
                 $"risk {latestDecision.riskLevel} {latestDecision.riskConfidence:P0}, " +
                 $"target {latestDecision.targetSpeedMps * 3.6f:F1} km/h";
+            if (latestDecision.weatherModelUsed)
+            {
+                summary +=
+                    $", weather {latestDecision.weatherContext} " +
+                    $"target {latestDecision.weatherTargetSpeedMps * 3.6f:F1} km/h";
+            }
             if (!string.IsNullOrWhiteSpace(latestDecision.overrideReason))
                 summary += $" ({latestDecision.overrideReason})";
             return summary;

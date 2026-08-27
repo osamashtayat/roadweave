@@ -7,6 +7,22 @@ using UnityEngine;
 public class TestLabSafetyTests
 {
     [Test]
+    public void MlDecisionJsonCarriesWeatherModelOutput()
+    {
+        const string json =
+            "{\"valid\":true,\"executedAction\":\"KEEP\"," +
+            "\"weatherContext\":\"Fog\",\"weatherModelUsed\":true," +
+            "\"weatherSpeedFactor\":0.41,\"weatherTargetSpeedMps\":5.7}";
+
+        TestLabMlDecision decision = JsonUtility.FromJson<TestLabMlDecision>(json);
+
+        Assert.That(decision.weatherModelUsed, Is.True);
+        Assert.That(decision.weatherContext, Is.EqualTo("Fog"));
+        Assert.That(decision.weatherSpeedFactor, Is.EqualTo(0.41f).Within(0.001f));
+        Assert.That(decision.weatherTargetSpeedMps, Is.EqualTo(5.7f).Within(0.001f));
+    }
+
+    [Test]
     public void WeatherRangeFactorChangesActiveSensorRange()
     {
         GameObject root = new GameObject("SensorTest");
@@ -411,6 +427,69 @@ public class TestLabSafetyTests
         finally
         {
             UnityEngine.Object.DestroyImmediate(ego);
+        }
+    }
+
+    [Test]
+    public void RiskDrivingModeIsExplicitAndResetsItsInterventionCounters()
+    {
+        GameObject ego = new GameObject("RiskDrivingEgo");
+        try
+        {
+            Type controllerType = FindRuntimeType("AutonomousTestVehicleController");
+            Component controller = CreateController(ego, controllerType);
+            controllerType.GetMethod("SetRiskDriving").Invoke(controller, new object[] { true });
+
+            Assert.That(GetProperty<bool>(controller, "IsRiskDrivingActive"), Is.True);
+            Assert.That(GetProperty<float>(controller, "CurrentDriverRequestedSpeedKph"), Is.EqualTo(80f));
+            Assert.That(GetProperty<bool>(controller, "IsMlRiskTakeoverActive"), Is.False);
+            Assert.That(GetProperty<string>(controller, "RiskDrivingSummary"), Does.Contain("Reckless driver requests"));
+
+            controllerType.GetMethod("UpdateRiskDrivingPhase", PrivateInstance)
+                .Invoke(controller, new object[] { 4f });
+            Assert.That(GetProperty<bool>(controller, "IsMlRiskTakeoverActive"), Is.False);
+            Assert.That(GetProperty<string>(controller, "RiskDrivingSummary"), Does.Contain("ML is observing"));
+
+            controllerType.GetMethod("UpdateRiskDrivingPhase", PrivateInstance)
+                .Invoke(controller, new object[] { 4f });
+            Assert.That(GetProperty<bool>(controller, "IsMlRiskTakeoverActive"), Is.True);
+            Assert.That(GetProperty<string>(controller, "RiskDrivingSummary"), Does.Contain("ML takeover"));
+
+            controllerType.GetMethod("SetRiskDriving").Invoke(controller, new object[] { false });
+            Assert.That(GetProperty<bool>(controller, "IsRiskDrivingActive"), Is.False);
+            Assert.That(GetProperty<int>(controller, "MlRiskInterventionCount"), Is.Zero);
+            Assert.That(GetProperty<int>(controller, "SafetyRiskInterventionCount"), Is.Zero);
+        }
+        finally
+        {
+            UnityEngine.Object.DestroyImmediate(ego);
+        }
+    }
+
+    [Test]
+    public void RiskDrivingButtonIsInstalledAtRuntimeWithoutEditingTheCanvasAsset()
+    {
+        GameObject coordinatorRoot = new GameObject("RiskButtonCoordinator");
+        GameObject panel = new GameObject("TestLabPanel", typeof(RectTransform));
+        GameObject template = new GameObject("RunTestButton", typeof(RectTransform), typeof(UnityEngine.UI.Image), typeof(UnityEngine.UI.Button));
+        template.transform.SetParent(panel.transform, false);
+        try
+        {
+            Type coordinatorType = FindRuntimeType("LiveTestCoordinator");
+            Component coordinator = coordinatorRoot.AddComponent(coordinatorType);
+            SetField(coordinator, "testLabPanel", panel);
+            coordinatorType.GetMethod("EnsureRuntimeRiskDrivingButton", PrivateInstance)
+                .Invoke(coordinator, null);
+
+            Transform installed = panel.transform.Find("RiskDrivingButton_Runtime");
+            Assert.That(installed, Is.Not.Null);
+            Assert.That(installed.GetComponent<UnityEngine.UI.Button>(), Is.Not.Null);
+        }
+        finally
+        {
+            UnityEngine.Object.DestroyImmediate(template);
+            UnityEngine.Object.DestroyImmediate(panel);
+            UnityEngine.Object.DestroyImmediate(coordinatorRoot);
         }
     }
 

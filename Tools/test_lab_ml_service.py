@@ -24,14 +24,15 @@ from ML.src.testlab_inference import (  # noqa: E402
 
 
 def arguments() -> argparse.Namespace:
-    default_risk, default_policy = default_model_paths(PROJECT_ROOT)
+    default_risk, default_policy, default_weather = default_model_paths(PROJECT_ROOT)
     parser = argparse.ArgumentParser(
-        description="Serve RoadWeave risk/policy predictions to Unity Test Lab."
+        description="Serve RoadWeave risk, policy, and weather predictions to Unity Test Lab."
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5075)
     parser.add_argument("--risk-model", type=Path, default=default_risk)
     parser.add_argument("--policy-model", type=Path, default=default_policy)
+    parser.add_argument("--weather-model", type=Path, default=default_weather)
     parser.add_argument("--confidence-threshold", type=float, default=0.45)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--self-test", action="store_true")
@@ -39,7 +40,11 @@ def arguments() -> argparse.Namespace:
 
 
 def create_engine(args: argparse.Namespace) -> TestLabInferenceEngine:
-    models = TestLabModelBundle.load(args.risk_model, args.policy_model)
+    models = TestLabModelBundle.load(
+        args.risk_model,
+        args.policy_model,
+        args.weather_model,
+    )
     return TestLabInferenceEngine(
         models,
         confidence_threshold=args.confidence_threshold,

@@ -194,6 +194,7 @@ public class TestMetricsRecorder : MonoBehaviour
             $"Status: {status}\n" +
             $"Scenario: {scenarioName}\n" +
             $"Weather: {weatherName}\n" +
+            $"{vehicle.RiskDrivingSummary}\n" +
             $"Maneuver: {vehicle.CurrentManeuver}\n" +
             $"Simulated Sensors:\n{vehicle.SensorSummary}\n" +
             $"Elapsed Time: {elapsedTime:F2} s\n" +

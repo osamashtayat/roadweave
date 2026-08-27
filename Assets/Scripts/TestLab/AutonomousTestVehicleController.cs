@@ -48,6 +48,12 @@ public class AutonomousTestVehicleController : MonoBehaviour
     [SerializeField, Min(0.5f)] private float blockedRecoveryDelaySeconds = 1.25f;
     [SerializeField, Min(0.5f)] private float retryCooldownSeconds = 3f;
 
+    [Header("Risk Driver Demonstration")]
+    [Tooltip("Unsafe speed requested by the simulated human driver. ML and the deterministic safety supervisor may reduce it.")]
+    [SerializeField, Min(35f)] private float riskDriverRequestedSpeedKph = 80f;
+    [Tooltip("How long the reckless driver remains visibly in control before the ML takeover is allowed to command the vehicle.")]
+    [SerializeField, Min(1f)] private float riskDriverExposureSeconds = 8f;
+
     public event Action<float> ObstacleDetected;
     // Preserved for the UI/metrics API. It now means obstacle braking only.
     public event Action BrakingStarted;
@@ -75,11 +81,50 @@ public class AutonomousTestVehicleController : MonoBehaviour
     public bool HasReachedDestination { get; private set; }
     public bool HasConfirmedCollision => collisionReported;
     public bool IsPredictiveEmergencyStopActive { get; private set; }
+    public bool IsRiskDrivingActive { get; private set; }
+    public bool IsMlRiskTakeoverActive =>
+        IsRiskDrivingActive && riskDrivingElapsedSeconds >= riskDriverExposureSeconds;
+    public float RiskDrivingSecondsUntilTakeover => IsRiskDrivingActive
+        ? Mathf.Max(0f, riskDriverExposureSeconds - riskDrivingElapsedSeconds)
+        : 0f;
+    public int MlRiskInterventionCount { get; private set; }
+    public int SafetyRiskInterventionCount { get; private set; }
+    public float CurrentDriverRequestedSpeedKph { get; private set; }
+    public float CurrentMlTargetSpeedKph { get; private set; }
     public string SensorSummary { get; private set; } = "No sensor scan yet";
-    public string DecisionSourceSummary => mlDecisionBridge != null
-        ? mlDecisionBridge.StatusSummary
-        : "ML: bridge unavailable (rule controller active)";
+    public string DecisionSourceSummary
+    {
+        get
+        {
+            if (IsRiskDrivingActive && !IsMlRiskTakeoverActive)
+                return $"ML: observing reckless driver; takeover in {RiskDrivingSecondsUntilTakeover:F1} s";
+            return mlDecisionBridge != null
+                ? mlDecisionBridge.StatusSummary
+                : "ML: bridge unavailable (rule controller active)";
+        }
+    }
     public VehicleDecelerationReason CurrentDecelerationReason { get; private set; }
+    public string RiskDrivingSummary
+    {
+        get
+        {
+            if (!IsRiskDrivingActive)
+                return "Risk driver: inactive";
+
+            if (!IsMlRiskTakeoverActive)
+            {
+                return $"Reckless driver requests {CurrentDriverRequestedSpeedKph:F1} km/h; " +
+                       $"ML is observing and takes over in {RiskDrivingSecondsUntilTakeover:F1} s; " +
+                       $"safety interventions {SafetyRiskInterventionCount}";
+            }
+
+            string mlStatus = activeMlDecision != null
+                ? $"ML takeover target {CurrentMlTargetSpeedKph:F1} km/h"
+                : "ML response unavailable; deterministic safety remains active";
+            return $"Risk driver requests {CurrentDriverRequestedSpeedKph:F1} km/h; {mlStatus}; " +
+                   $"ML interventions {MlRiskInterventionCount}, safety interventions {SafetyRiskInterventionCount}";
+        }
+    }
     public string CurrentManeuver
     {
         get
@@ -132,6 +177,9 @@ public class AutonomousTestVehicleController : MonoBehaviour
     private bool hasMlMotionSample;
     private bool obstacleWasDetected;
     private bool wasObstacleBraking;
+    private bool wasMlRiskIntervention;
+    private bool wasSafetyRiskIntervention;
+    private float riskDrivingElapsedSeconds;
     private bool collisionReported;
     private bool hasEverRun;
     private ScenarioActorMarker overtakingActor;
@@ -165,11 +213,7 @@ public class AutonomousTestVehicleController : MonoBehaviour
 
         IsPredictiveEmergencyStopActive = false;
         float deltaTime = Time.fixedDeltaTime;
-        weatherCruisingFactor = Mathf.MoveTowards(
-            weatherCruisingFactor,
-            targetWeatherCruisingFactor,
-            0.12f * deltaTime
-        );
+        UpdateRiskDrivingPhase(deltaTime);
         UpdateRouteProgress();
         float remainingRouteDistance = routeLength - routeProgress;
         if (remainingRouteDistance <= destinationReachedDistance)
@@ -270,9 +314,43 @@ public class AutonomousTestVehicleController : MonoBehaviour
         float unrestrictedSpeedKph = overtakePhase == OvertakePhase.Passing ||
                                      overtakePhase == OvertakePhase.CruisingLeft
             ? Mathf.Max(maximumSpeedKph, passingSpeedKph, 30f)
-            : maximumSpeedKph;
+            : IsRiskDrivingActive
+                ? Mathf.Max(maximumSpeedKph, riskDriverRequestedSpeedKph)
+                : maximumSpeedKph;
         float unrestrictedSpeedMps = unrestrictedSpeedKph / 3.6f;
+        float effectiveWeatherFactor = targetWeatherCruisingFactor;
+        if (activeMlDecision != null &&
+            activeMlDecision.weatherModelUsed &&
+            activeMlDecision.weatherTargetSpeedMps > 0f &&
+            string.Equals(
+                activeMlDecision.weatherContext,
+                weatherContext,
+                StringComparison.OrdinalIgnoreCase
+            ))
+        {
+            // The model learns an absolute cautious speed against its 50 km/h
+            // training reference. Convert that cap into a factor for the
+            // vehicle's current cruise/overtake/risk-driving request.
+            effectiveWeatherFactor = Mathf.Clamp(
+                activeMlDecision.weatherTargetSpeedMps /
+                    Mathf.Max(0.1f, unrestrictedSpeedMps),
+                0.35f,
+                1f
+            );
+        }
+        weatherCruisingFactor = Mathf.MoveTowards(
+            weatherCruisingFactor,
+            effectiveWeatherFactor,
+            0.20f * deltaTime
+        );
         float desiredSpeedMps = unrestrictedSpeedMps * speedFactor * weatherCruisingFactor;
+        CurrentDriverRequestedSpeedKph = IsRiskDrivingActive
+            ? Mathf.Max(maximumSpeedKph, riskDriverRequestedSpeedKph)
+            : maximumSpeedKph;
+        bool mlControlAllowed = !IsRiskDrivingActive || IsMlRiskTakeoverActive;
+        CurrentMlTargetSpeedKph = activeMlDecision != null && mlControlAllowed
+            ? Mathf.Max(0f, activeMlDecision.targetSpeedMps) * 3.6f
+            : 0f;
         VehicleDecelerationReason requestedReason = GetEnvironmentDecelerationReason();
 
         // The learned speed target is advisory during cruise/following only.
@@ -280,13 +358,22 @@ public class AutonomousTestVehicleController : MonoBehaviour
         // the ML would otherwise keep braking for the vehicle being passed
         // (still "in front" until the lane change completes) and stop the
         // overtake.
-        if (activeMlDecision != null && overtakePhase == OvertakePhase.None)
+        if (mlControlAllowed && activeMlDecision != null && overtakePhase == OvertakePhase.None)
         {
             float modelTarget = Mathf.Max(0f, activeMlDecision.targetSpeedMps);
             if (modelTarget < desiredSpeedMps - 0.05f)
                 requestedReason = VehicleDecelerationReason.Maneuver;
             desiredSpeedMps = Mathf.Min(desiredSpeedMps, modelTarget);
         }
+
+        bool mlRiskIntervention = IsRiskDrivingActive &&
+                                  IsMlRiskTakeoverActive &&
+                                  activeMlDecision != null &&
+                                  overtakePhase == OvertakePhase.None &&
+                                  activeMlDecision.targetSpeedMps < unrestrictedSpeedMps - 0.05f;
+        if (mlRiskIntervention && !wasMlRiskIntervention)
+            MlRiskInterventionCount++;
+        wasMlRiskIntervention = mlRiskIntervention;
 
         float turnAngle = steeringDirection.sqrMagnitude > 0.001f
             ? Vector3.Angle(GetMovementForward(nextRotation), steeringDirection.normalized)
@@ -298,6 +385,10 @@ public class AutonomousTestVehicleController : MonoBehaviour
         }
 
         bool obstacleLimited = ApplySensorDecision(sensors, ref desiredSpeedMps);
+        bool safetyRiskIntervention = IsRiskDrivingActive && obstacleLimited;
+        if (safetyRiskIntervention && !wasSafetyRiskIntervention)
+            SafetyRiskInterventionCount++;
+        wasSafetyRiskIntervention = safetyRiskIntervention;
         if (obstacleLimited)
             requestedReason = VehicleDecelerationReason.Obstacle;
         else if (IsLaneChangePhase() && desiredSpeedMps < unrestrictedSpeedMps * speedFactor - 0.05f)
@@ -368,6 +459,14 @@ public class AutonomousTestVehicleController : MonoBehaviour
         HasReachedDestination = false;
         collisionReported = false;
         hasEverRun = false;
+        IsRiskDrivingActive = false;
+        riskDrivingElapsedSeconds = 0f;
+        MlRiskInterventionCount = 0;
+        SafetyRiskInterventionCount = 0;
+        CurrentDriverRequestedSpeedKph = maximumSpeedKph;
+        CurrentMlTargetSpeedKph = 0f;
+        wasMlRiskIntervention = false;
+        wasSafetyRiskIntervention = false;
         activeMlDecision = null;
         hasMlMotionSample = false;
         previousMlSpeedMps = currentSpeedMps;
@@ -395,6 +494,34 @@ public class AutonomousTestVehicleController : MonoBehaviour
             hasEverRun = true;
     }
 
+    public void SetRiskDriving(bool enabled)
+    {
+        if (IsRiskDrivingActive == enabled)
+            return;
+
+        IsRiskDrivingActive = enabled;
+        riskDrivingElapsedSeconds = 0f;
+        MlRiskInterventionCount = 0;
+        SafetyRiskInterventionCount = 0;
+        CurrentDriverRequestedSpeedKph = enabled
+            ? Mathf.Max(maximumSpeedKph, riskDriverRequestedSpeedKph)
+            : maximumSpeedKph;
+        CurrentMlTargetSpeedKph = 0f;
+        wasMlRiskIntervention = false;
+        wasSafetyRiskIntervention = false;
+    }
+
+    private void UpdateRiskDrivingPhase(float deltaTime)
+    {
+        if (!IsRiskDrivingActive || IsMlRiskTakeoverActive)
+            return;
+
+        riskDrivingElapsedSeconds = Mathf.Min(
+            riskDriverExposureSeconds,
+            riskDrivingElapsedSeconds + Mathf.Max(0f, deltaTime)
+        );
+    }
+
     public void SetEnvironmentModifiers(float newSpeedFactor, float newBrakingFactor, float newDetectionFactor)
     {
         speedFactor = Mathf.Clamp(newSpeedFactor, 0.1f, 1.5f);
@@ -406,7 +533,9 @@ public class AutonomousTestVehicleController : MonoBehaviour
 
     public void SetWeatherCruisingFactor(float factor)
     {
-        targetWeatherCruisingFactor = Mathf.Clamp(factor, 0.5f, 1f);
+        // This remains the deterministic fallback when the Python service or
+        // weather model is unavailable. A fresh ML response supersedes it.
+        targetWeatherCruisingFactor = Mathf.Clamp(factor, 0.35f, 1f);
     }
 
     public void SetWeatherContext(string context)
@@ -1008,7 +1137,9 @@ public class AutonomousTestVehicleController : MonoBehaviour
         float targetKph = passing
             ? Mathf.Max(maximumSpeedKph, passingSpeedKph, 30f)
             : maximumSpeedKph;
-        return targetKph * speedFactor * weatherCruisingFactor / 3.6f;
+        // Send the unmodified reference to Python. Unity applies either the
+        // learned weather factor or the fallback exactly once after the reply.
+        return targetKph * speedFactor / 3.6f;
     }
 
     private static string DescribeObservation(SimulatedActorObservation observation)

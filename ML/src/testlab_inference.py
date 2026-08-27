@@ -20,9 +20,13 @@ import time
 try:
     from ML.src.features import new_state, set_slot, summarize_history
     from ML.src.model_support import load_artifact, predict_one
+    from ML.src.weather_features import normalize_condition, summarize_weather_history
+    from ML.src.weather_model import load_weather_artifact, predict_weather_factor
 except ModuleNotFoundError:
     from features import new_state, set_slot, summarize_history  # type: ignore
     from model_support import load_artifact, predict_one  # type: ignore
+    from weather_features import normalize_condition, summarize_weather_history  # type: ignore
+    from weather_model import load_weather_artifact, predict_weather_factor  # type: ignore
 
 
 PROTOCOL_VERSION = "roadweave.testlab-ml/1.0"
@@ -53,19 +57,37 @@ def _present(slot: Any) -> bool:
 class TestLabModelBundle:
     risk: Mapping[str, Any]
     policy: Mapping[str, Any]
+    weather: Optional[Mapping[str, Any]] = None
 
     @classmethod
-    def load(cls, risk_path: Path, policy_path: Path) -> "TestLabModelBundle":
+    def load(
+        cls,
+        risk_path: Path,
+        policy_path: Path,
+        weather_path: Optional[Path] = None,
+    ) -> "TestLabModelBundle":
         return cls(
             risk=load_artifact(risk_path, expected_task="risk"),
             policy=load_artifact(policy_path, expected_task="policy"),
+            weather=(
+                load_weather_artifact(weather_path)
+                if weather_path is not None and Path(weather_path).is_file()
+                else None
+            ),
         )
 
     @property
     def version(self) -> str:
         risk_version = str(self.risk.get("model_version", "unknown"))
         policy_version = str(self.policy.get("model_version", "unknown"))
-        return "risk={};policy={}".format(risk_version, policy_version)
+        weather_version = (
+            str(self.weather.get("model_version", "unknown"))
+            if self.weather is not None
+            else "fallback"
+        )
+        return "risk={};policy={};weather={}".format(
+            risk_version, policy_version, weather_version
+        )
 
 
 @dataclass
@@ -180,6 +202,33 @@ class TestLabInferenceEngine:
         risk, risk_confidence, _ = predict_one(self.models.risk, summary)
         requested_action, action_confidence, _ = predict_one(self.models.policy, summary)
 
+        weather_context = normalize_condition(message.get("weather", "Dry"))
+        weather_model_used = (
+            self.models.weather is not None and weather_context != "DRY"
+        )
+        weather_speed_factor = 1.0
+        weather_target_speed_mps = max(
+            0.0, _finite_number(message.get("cruiseSpeedMps"), 0.0)
+        )
+        if weather_model_used:
+            assert self.models.weather is not None
+            weather_summary = summarize_weather_history(
+                session.history,
+                weather_context,
+            )
+            weather_speed_factor = predict_weather_factor(
+                self.models.weather,
+                weather_summary,
+                weather_context,
+            )
+            weather_reference_kph = max(
+                1.0,
+                _finite_number(self.models.weather.get("reference_speed_kph"), 50.0),
+            )
+            weather_target_speed_mps = (
+                weather_speed_factor * weather_reference_kph / 3.6
+            )
+
         executed_action, override_reason = self._supervise_model_decision(
             session,
             message,
@@ -204,7 +253,10 @@ class TestLabInferenceEngine:
             target_speed_mps=target_speed,
             override_reason=override_reason,
             history_samples=len(session.history),
-            weather_context=str(message.get("weather", "Dry")),
+            weather_context=weather_context.title(),
+            weather_model_used=weather_model_used,
+            weather_speed_factor=weather_speed_factor,
+            weather_target_speed_mps=weather_target_speed_mps,
         )
 
     def _build_state(self, message: Mapping[str, Any]) -> Dict[str, float]:
@@ -353,7 +405,14 @@ class TestLabInferenceEngine:
         if action == EMERGENCY_STOP:
             return 0.0
         if action == DECELERATE:
-            return max(0.0, speed - 3.0)
+            # A learned risk classification is advisory, not proof that the
+            # vehicle must stop. Repeated 5 Hz DECELERATE decisions used to
+            # subtract 3 m/s each time until an EXTREME prediction parked the
+            # car for several seconds. Keep a useful cautious-speed floor and
+            # reserve zero speed for the deterministic emergency envelopes
+            # above (pedestrian/front-object danger).
+            cautious_speed = min(cruise, max(2.0, cruise * 0.55))
+            return min(cruise, max(cautious_speed, speed - 1.0))
         if action == ACCELERATE:
             return min(cruise, speed + 2.0)
         if action in (CHANGE_LEFT, CHANGE_RIGHT):
@@ -401,15 +460,19 @@ class TestLabInferenceEngine:
             "override_reason": "overrideReason",
             "history_samples": "historySamples",
             "weather_context": "weatherContext",
+            "weather_model_used": "weatherModelUsed",
+            "weather_speed_factor": "weatherSpeedFactor",
+            "weather_target_speed_mps": "weatherTargetSpeedMps",
         }
         for key, value in values.items():
             response[camel_names.get(key, key)] = value
         return response
 
 
-def default_model_paths(project_root: Path) -> Tuple[Path, Path]:
+def default_model_paths(project_root: Path) -> Tuple[Path, Path, Path]:
     root = Path(project_root).expanduser().resolve()
     return (
         root / "ML" / "models" / "risk_model.joblib",
         root / "ML" / "models" / "policy_model.joblib",
+        root / "ML" / "models" / "weather_model.joblib",
     )

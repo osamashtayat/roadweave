@@ -207,6 +207,25 @@ public class DigitalTwinCoreTests
         Assert.That(ego.GetComponent<Renderer>().enabled, Is.True);
     }
 
+    [TestCase(-1d, 0d, 1d, 0f)]
+    [TestCase(0.5d, 0d, 1d, 0.5f)]
+    [TestCase(2d, 0d, 1d, 1f)]
+    [TestCase(1d, 1d, 1d, 1f)]
+    public void StreamingPoseInterpolationClampsToReceivedSamples(
+        double time,
+        double from,
+        double to,
+        float expected)
+    {
+        MethodInfo factor = RuntimeType("EgoVehicleReplayView").GetMethod(
+            "SourceInterpolationFactor",
+            BindingFlags.Static | BindingFlags.NonPublic);
+
+        Assert.That(factor, Is.Not.Null);
+        float result = (float)factor.Invoke(null, new object[] { time, from, to });
+        Assert.That(result, Is.EqualTo(expected).Within(0.0001f));
+    }
+
     [Test]
     public void WheelIntegrationPreservesLargeDoubleTimestampDeltas()
     {
