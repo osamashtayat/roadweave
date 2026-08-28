@@ -40,6 +40,10 @@ public sealed class TestLabMlDecision
     public bool weatherModelUsed;
     public float weatherSpeedFactor = 1f;
     public float weatherTargetSpeedMps;
+    public VirtualSensorReliabilityDecision[] sensorReliability =
+        Array.Empty<VirtualSensorReliabilityDecision>();
+    public float overallSensorReliability = 1f;
+    public string sensorSafetyMode;
     public string error;
 
     public TestLabMlAction Action => ParseAction(executedAction);
@@ -57,6 +61,15 @@ public sealed class TestLabMlDecision
             default: return TestLabMlAction.None;
         }
     }
+}
+
+[Serializable]
+public sealed class VirtualSensorReliabilityDecision
+{
+    public string sensorId;
+    public string sensorType;
+    public float reliability = 1f;
+    public string status;
 }
 
 [DisallowMultipleComponent]
@@ -112,6 +125,13 @@ public sealed class TestLabMlDecisionBridge : MonoBehaviour
                     $", weather {latestDecision.weatherContext} " +
                     $"target {latestDecision.weatherTargetSpeedMps * 3.6f:F1} km/h";
             }
+            if (latestDecision.sensorReliability != null &&
+                latestDecision.sensorReliability.Length > 0)
+            {
+                summary +=
+                    $", sensors {latestDecision.overallSensorReliability:P0} " +
+                    $"{latestDecision.sensorSafetyMode}";
+            }
             if (!string.IsNullOrWhiteSpace(latestDecision.overrideReason))
                 summary += $" ({latestDecision.overrideReason})";
             return summary;
@@ -158,6 +178,7 @@ public sealed class TestLabMlDecisionBridge : MonoBehaviour
         public ActorObservation leftFront;
         public ActorObservation leftRear;
         public ActorObservation pedestrian;
+        public VirtualSensorHealthFeatures[] sensorHealth;
     }
 
     [Serializable]
@@ -233,7 +254,8 @@ public sealed class TestLabMlDecisionBridge : MonoBehaviour
         float physicalLaneOffset,
         float leftLaneOffset,
         float cruiseSpeedMps,
-        string weather)
+        string weather,
+        VirtualSensorHealthFeatures[] sensorHealth)
     {
         if (!enableMlDecisions || sensors == null)
             return;
@@ -266,9 +288,46 @@ public sealed class TestLabMlDecisionBridge : MonoBehaviour
             rightRear = BuildObservation(sensors.rightLaneRear),
             leftFront = BuildObservation(sensors.leftLaneFront),
             leftRear = BuildObservation(sensors.leftLaneRear),
-            pedestrian = BuildObservation(sensors.pedestrianHazard)
+            pedestrian = BuildObservation(sensors.pedestrianHazard),
+            sensorHealth = SanitizeSensorHealth(sensorHealth)
         };
         SendJson(JsonUtility.ToJson(request));
+    }
+
+    private static VirtualSensorHealthFeatures[] SanitizeSensorHealth(
+        VirtualSensorHealthFeatures[] source)
+    {
+        if (source == null || source.Length == 0)
+            return Array.Empty<VirtualSensorHealthFeatures>();
+        VirtualSensorHealthFeatures[] result = new VirtualSensorHealthFeatures[source.Length];
+        for (int index = 0; index < source.Length; index++)
+        {
+            VirtualSensorHealthFeatures item = source[index] ?? new VirtualSensorHealthFeatures();
+            result[index] = new VirtualSensorHealthFeatures
+            {
+                sensorId = item.sensorId,
+                sensorType = item.sensorType,
+                weather = item.weather,
+                dropoutRate = Sanitize(item.dropoutRate),
+                messageAgeMean = Sanitize(item.messageAgeMean),
+                messageAgeMax = Sanitize(item.messageAgeMax),
+                detectionCountMean = Sanitize(item.detectionCountMean),
+                detectionCountStd = Sanitize(item.detectionCountStd),
+                confidenceMean = Sanitize(item.confidenceMean),
+                confidenceStd = Sanitize(item.confidenceStd),
+                trackContinuity = Sanitize(item.trackContinuity),
+                rangeVariance = Sanitize(item.rangeVariance),
+                velocityVariance = Sanitize(item.velocityVariance),
+                innovationMean = Sanitize(item.innovationMean),
+                innovationStd = Sanitize(item.innovationStd),
+                crossSensorDisagreement = Sanitize(item.crossSensorDisagreement),
+                egoSpeedMean = Sanitize(item.egoSpeedMean),
+                egoSpeedStd = Sanitize(item.egoSpeedStd),
+                yawRateMean = Sanitize(item.yawRateMean),
+                yawRateStd = Sanitize(item.yawRateStd)
+            };
+        }
+        return result;
     }
 
     public bool TryGetFreshDecision(out TestLabMlDecision decision)

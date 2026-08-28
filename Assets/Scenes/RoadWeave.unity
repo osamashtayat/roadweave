@@ -4762,9 +4762,8 @@ MonoBehaviour:
   applyPosition: 1
   applyRotation: 1
   smoothStreamingSources: 1
-  positionSmoothness: 18
-  rotationSmoothness: 14
-  maximumExtrapolationSeconds: 0.2
+  streamingInterpolationDelaySeconds: 0.16
+  maximumBufferedPoses: 24
 --- !u!114 &1154259290
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -7485,8 +7484,8 @@ RectTransform:
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
   m_AnchorMin: {x: 0, y: 0}
   m_AnchorMax: {x: 1, y: 1}
-  m_AnchoredPosition: {x: 601.4722, y: -111.31662}
-  m_SizeDelta: {x: -1219.9424, y: -363.0751}
+  m_AnchoredPosition: {x: 523.83844, y: -114.45172}
+  m_SizeDelta: {x: -1064.6746, y: -356.8048}
   m_Pivot: {x: 0.5, y: 0.5}
 --- !u!114 &1815225036
 MonoBehaviour:

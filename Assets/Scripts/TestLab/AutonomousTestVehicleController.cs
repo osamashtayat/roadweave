@@ -91,6 +91,15 @@ public class AutonomousTestVehicleController : MonoBehaviour
     public int SafetyRiskInterventionCount { get; private set; }
     public float CurrentDriverRequestedSpeedKph { get; private set; }
     public float CurrentMlTargetSpeedKph { get; private set; }
+    public float CurrentSensorReliability => activeMlDecision != null &&
+        activeMlDecision.sensorReliability != null &&
+        activeMlDecision.sensorReliability.Length > 0
+            ? Mathf.Clamp01(activeMlDecision.overallSensorReliability)
+            : 1f;
+    public string SensorSafetyMode => activeMlDecision != null &&
+        !string.IsNullOrWhiteSpace(activeMlDecision.sensorSafetyMode)
+            ? activeMlDecision.sensorSafetyMode
+            : "Unavailable";
     public string SensorSummary { get; private set; } = "No sensor scan yet";
     public string DecisionSourceSummary
     {
@@ -159,6 +168,9 @@ public class AutonomousTestVehicleController : MonoBehaviour
     private readonly List<float> routeDistances = new List<float>();
     private Rigidbody physicsBody;
     private SimulatedVehicleSensorSuite sensorSuite;
+    private VirtualPerceptionSensorRig virtualSensorRig;
+    private VirtualSensorHealthFeatures[] latestSensorHealth =
+        Array.Empty<VirtualSensorHealthFeatures>();
     private TestLabMlDecisionBridge mlDecisionBridge;
     private TestLabMlDecision activeMlDecision;
     private int waypointIndex;
@@ -202,6 +214,9 @@ public class AutonomousTestVehicleController : MonoBehaviour
         sensorSuite = GetComponent<SimulatedVehicleSensorSuite>();
         if (sensorSuite == null)
             sensorSuite = gameObject.AddComponent<SimulatedVehicleSensorSuite>();
+        virtualSensorRig = GetComponent<VirtualPerceptionSensorRig>();
+        if (virtualSensorRig == null)
+            virtualSensorRig = gameObject.AddComponent<VirtualPerceptionSensorRig>();
         mlDecisionBridge = GetComponent<TestLabMlDecisionBridge>();
         RefreshEgoCollisionEnvelope();
     }
@@ -246,7 +261,7 @@ public class AutonomousTestVehicleController : MonoBehaviour
         hasMlMotionSample = true;
 
         Vector3 egoVelocity = currentMovementForward * currentSpeedMps;
-        SimulatedSensorSnapshot sensors = sensorSuite.Scan(
+        SimulatedSensorSnapshot groundTruthSensors = sensorSuite.Scan(
             physicsBody.position,
             routeForward,
             routeRight,
@@ -254,6 +269,15 @@ public class AutonomousTestVehicleController : MonoBehaviour
             transform,
             egoVelocity
         );
+        VirtualPerceptionFrame perception = virtualSensorRig.Observe(
+            groundTruthSensors,
+            weatherContext,
+            Time.realtimeSinceStartup,
+            currentSpeedMps,
+            measuredYawRate
+        );
+        SimulatedSensorSnapshot sensors = perception.fusedSnapshot;
+        latestSensorHealth = perception.sensorHealth;
         if (mlDecisionBridge != null)
         {
             mlDecisionBridge.RequestDecision(
@@ -264,7 +288,8 @@ public class AutonomousTestVehicleController : MonoBehaviour
                 physicalLaneOffset,
                 -overtakeLaneOffset,
                 GetMlCruiseSpeedMps(),
-                weatherContext
+                weatherContext,
+                latestSensorHealth
             );
             if (!mlDecisionBridge.TryGetFreshDecision(out activeMlDecision))
                 activeMlDecision = null;
@@ -353,6 +378,21 @@ public class AutonomousTestVehicleController : MonoBehaviour
             : 0f;
         VehicleDecelerationReason requestedReason = GetEnvironmentDecelerationReason();
 
+        if (activeMlDecision != null &&
+            activeMlDecision.sensorReliability != null &&
+            activeMlDecision.sensorReliability.Length > 0)
+        {
+            string safetyMode = activeMlDecision.sensorSafetyMode ?? "NORMAL";
+            if (string.Equals(safetyMode, "MINIMAL_RISK", StringComparison.OrdinalIgnoreCase))
+                desiredSpeedMps = 0f;
+            else if (string.Equals(safetyMode, "RESTRICTED", StringComparison.OrdinalIgnoreCase))
+                desiredSpeedMps = Mathf.Min(desiredSpeedMps, unrestrictedSpeedMps * 0.45f);
+            else if (string.Equals(safetyMode, "CAUTIOUS", StringComparison.OrdinalIgnoreCase))
+                desiredSpeedMps = Mathf.Min(desiredSpeedMps, unrestrictedSpeedMps * 0.75f);
+            if (!string.Equals(safetyMode, "NORMAL", StringComparison.OrdinalIgnoreCase))
+                requestedReason = VehicleDecelerationReason.Maneuver;
+        }
+
         // The learned speed target is advisory during cruise/following only.
         // During an active overtake the rule state machine owns the speed, and
         // the ML would otherwise keep braking for the vehicle being passed
@@ -384,7 +424,10 @@ public class AutonomousTestVehicleController : MonoBehaviour
             requestedReason = VehicleDecelerationReason.Curve;
         }
 
-        bool obstacleLimited = ApplySensorDecision(sensors, ref desiredSpeedMps);
+        // The learned policy and lane planner consume the noisy fused frame.
+        // The deterministic collision envelope intentionally retains the
+        // untouched Unity truth as a final research-prototype safety backstop.
+        bool obstacleLimited = ApplySensorDecision(groundTruthSensors, ref desiredSpeedMps);
         bool safetyRiskIntervention = IsRiskDrivingActive && obstacleLimited;
         if (safetyRiskIntervention && !wasSafetyRiskIntervention)
             SafetyRiskInterventionCount++;
@@ -989,7 +1032,13 @@ public class AutonomousTestVehicleController : MonoBehaviour
 
     private bool IsOvertakeCandidate(SimulatedActorObservation observation)
     {
-        if (!enableOvertaking || observation == null || observation.actor == null)
+        bool reliabilityAllowsLaneChange = activeMlDecision == null ||
+            activeMlDecision.sensorReliability == null ||
+            activeMlDecision.sensorReliability.Length == 0 ||
+            string.Equals(activeMlDecision.sensorSafetyMode, "NORMAL", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(activeMlDecision.sensorSafetyMode, "CAUTIOUS", StringComparison.OrdinalIgnoreCase);
+        if (!enableOvertaking || !reliabilityAllowsLaneChange ||
+            observation == null || observation.actor == null)
             return false;
         ScenarioActorMarker actor = observation.actor;
         if (!actor.CanOvertake || actor.SemanticClass == ScenarioActorClass.Pedestrian)
@@ -1126,7 +1175,8 @@ public class AutonomousTestVehicleController : MonoBehaviour
             $"Right rear: {DescribeObservation(sensors.rightLaneRear)}\n" +
             $"Left front: {DescribeObservation(sensors.leftLaneFront)}\n" +
             $"Left rear: {DescribeObservation(sensors.leftLaneRear)}\n" +
-            $"Pedestrian risk: {DescribeObservation(sensors.pedestrianHazard)}";
+            $"Pedestrian risk: {DescribeObservation(sensors.pedestrianHazard)}\n" +
+            $"Virtual rig: {(virtualSensorRig != null ? virtualSensorRig.FaultSummary : "unavailable")}";
     }
 
     private float GetMlCruiseSpeedMps()

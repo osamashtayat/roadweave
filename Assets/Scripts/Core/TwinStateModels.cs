@@ -226,6 +226,19 @@ public class TwinActorState
     public TwinDataValidity validity = TwinDataValidity.Unknown;
 }
 
+[Serializable]
+public class TwinSensorHealthState
+{
+    public string sensorId;
+    public string sensorType;
+    [Tooltip("Estimated observation quality in [0, 1], not hardware certification.")]
+    public float reliability;
+    public string status;
+    public float messageAgeSeconds;
+    public float dropoutRate;
+    public TwinDataValidity validity = TwinDataValidity.Unknown;
+}
+
 /// <summary>
 /// The single source-neutral contract consumed by RoadWeave presentation code.
 /// Values use the units documented on each field and the coordinate frame in metadata.
@@ -240,6 +253,8 @@ public class TwinSnapshot
     [Tooltip("Optional route-ahead data. Older sources may omit it.")]
     public TwinRouteState route;
     public TwinActorState[] actors = Array.Empty<TwinActorState>();
+    [Tooltip("Optional source-neutral sensor-quality estimates. Older sources may omit it.")]
+    public TwinSensorHealthState[] sensorHealth = Array.Empty<TwinSensorHealthState>();
 }
 
 public interface ITwinSnapshotSink

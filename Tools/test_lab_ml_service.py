@@ -20,11 +20,13 @@ from ML.src.testlab_inference import (  # noqa: E402
     TestLabInferenceEngine,
     TestLabModelBundle,
     default_model_paths,
+    default_sensor_model_paths,
 )
 
 
 def arguments() -> argparse.Namespace:
     default_risk, default_policy, default_weather = default_model_paths(PROJECT_ROOT)
+    default_sensors = default_sensor_model_paths(PROJECT_ROOT)
     parser = argparse.ArgumentParser(
         description="Serve RoadWeave risk, policy, and weather predictions to Unity Test Lab."
     )
@@ -33,6 +35,9 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--risk-model", type=Path, default=default_risk)
     parser.add_argument("--policy-model", type=Path, default=default_policy)
     parser.add_argument("--weather-model", type=Path, default=default_weather)
+    parser.add_argument("--camera-reliability-model", type=Path, default=default_sensors["CAMERA"])
+    parser.add_argument("--lidar-reliability-model", type=Path, default=default_sensors["LIDAR"])
+    parser.add_argument("--radar-reliability-model", type=Path, default=default_sensors["RADAR"])
     parser.add_argument("--confidence-threshold", type=float, default=0.45)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--self-test", action="store_true")
@@ -44,6 +49,11 @@ def create_engine(args: argparse.Namespace) -> TestLabInferenceEngine:
         args.risk_model,
         args.policy_model,
         args.weather_model,
+        {
+            "CAMERA": args.camera_reliability_model,
+            "LIDAR": args.lidar_reliability_model,
+            "RADAR": args.radar_reliability_model,
+        },
     )
     return TestLabInferenceEngine(
         models,
@@ -82,6 +92,30 @@ def observation(sequence: int, pedestrian_gap: float = -1.0) -> Dict[str, Any]:
         "leftFront": {"present": False},
         "leftRear": {"present": False},
         "pedestrian": pedestrian,
+        "sensorHealth": [
+            {
+                "sensorId": "front_camera",
+                "sensorType": "Camera",
+                "weather": "Dry",
+                "dropoutRate": 0.02,
+                "messageAgeMean": 0.08,
+                "messageAgeMax": 0.10,
+                "detectionCountMean": 2.0,
+                "detectionCountStd": 0.2,
+                "confidenceMean": 0.94,
+                "confidenceStd": 0.03,
+                "trackContinuity": 0.96,
+                "rangeVariance": 2.0,
+                "velocityVariance": 0.3,
+                "innovationMean": 0.2,
+                "innovationStd": 0.1,
+                "crossSensorDisagreement": 0.25,
+                "egoSpeedMean": 8.0,
+                "egoSpeedStd": 0.1,
+                "yawRateMean": 0.0,
+                "yawRateStd": 0.3,
+            }
+        ],
     }
 
 

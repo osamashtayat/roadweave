@@ -118,6 +118,34 @@ simulated vehicle:
 - conservative deceleration for low-confidence, high-risk, or extreme-risk requests;
 - continued 30 Hz safety/physics updates around the 5 Hz learned decisions.
 
+## Virtual-sensor reliability models
+
+- Models: three histogram gradient-boosting regressors (camera, LiDAR, radar)
+- Training source: reproducible RoadWeave object-level fault simulation
+- Dataset: 12,000 group-disjoint scenarios / 36,000 sensor windows
+- Window: 3 seconds
+- Conditions: dry, rain, snow, fog
+- Fault families: dropout, range noise, velocity noise, bias, latency, false
+  positives, calibration drift, complete failure, and nominal operation
+- Test MAE: camera 0.0137; LiDAR 0.0171; radar 0.0168
+- Test R²: camera 0.986; LiDAR 0.984; radar 0.989
+- `FAILED` status recall: camera 0.931; LiDAR 0.984; radar 1.000
+- Status macro-F1: camera 0.957; LiDAR 0.962; radar 0.713
+
+The continuous target is calculated from held-out ground truth using detection
+recall and precision, range and velocity accuracy, message freshness, and track
+continuity. Injected fault name and severity are retained only for evaluation;
+they are excluded from training inputs. The learned scores substantially beat
+the mean-confidence baseline on MAE, while the lower discrete status F1—most
+noticeably radar—reflects rare boundary classes rather than poor continuous
+regression. The continuous score is therefore the primary metric.
+
+These are virtual-sensor models, not hardware-certified estimators. They prove
+that RoadWeave can detect and react to simulated degradation through a stable
+interface. They do not prove transfer to a particular physical camera, LiDAR,
+or radar. Hardware deployment requires synchronized gateway health windows,
+controlled real fault injection, calibration checks, and external validation.
+
 ## Required next research work
 
 1. Improve cross-domain generalization and calibration; the risk model's ~0.08
@@ -130,3 +158,5 @@ simulated vehicle:
    `Tools/benchmark_controllers.py`) on minimum TTC, clearance, intervention
    count, deadlock time, route progress, and comfort.
 4. Keep the ML controller in Test Lab/simulation until those checks are complete.
+5. Validate the reliability feature distributions against a real sensor gateway
+   and retrain/calibrate the three regressors before using hardware scores.

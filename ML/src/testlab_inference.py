@@ -22,11 +22,19 @@ try:
     from ML.src.model_support import load_artifact, predict_one
     from ML.src.weather_features import normalize_condition, summarize_weather_history
     from ML.src.weather_model import load_weather_artifact, predict_weather_factor
+    from ML.src.sensor_reliability_model import (
+        load_sensor_reliability_artifact,
+        predict_sensor_reliability,
+    )
 except ModuleNotFoundError:
     from features import new_state, set_slot, summarize_history  # type: ignore
     from model_support import load_artifact, predict_one  # type: ignore
     from weather_features import normalize_condition, summarize_weather_history  # type: ignore
     from weather_model import load_weather_artifact, predict_weather_factor  # type: ignore
+    from sensor_reliability_model import (  # type: ignore
+        load_sensor_reliability_artifact,
+        predict_sensor_reliability,
+    )
 
 
 PROTOCOL_VERSION = "roadweave.testlab-ml/1.0"
@@ -58,6 +66,7 @@ class TestLabModelBundle:
     risk: Mapping[str, Any]
     policy: Mapping[str, Any]
     weather: Optional[Mapping[str, Any]] = None
+    sensor_reliability: Dict[str, Mapping[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def load(
@@ -65,7 +74,15 @@ class TestLabModelBundle:
         risk_path: Path,
         policy_path: Path,
         weather_path: Optional[Path] = None,
+        sensor_model_paths: Optional[Mapping[str, Path]] = None,
     ) -> "TestLabModelBundle":
+        reliability_models: Dict[str, Mapping[str, Any]] = {}
+        for sensor_type, model_path in (sensor_model_paths or {}).items():
+            if model_path is not None and Path(model_path).is_file():
+                normalized = str(sensor_type).strip().upper()
+                reliability_models[normalized] = load_sensor_reliability_artifact(
+                    Path(model_path), normalized
+                )
         return cls(
             risk=load_artifact(risk_path, expected_task="risk"),
             policy=load_artifact(policy_path, expected_task="policy"),
@@ -74,6 +91,7 @@ class TestLabModelBundle:
                 if weather_path is not None and Path(weather_path).is_file()
                 else None
             ),
+            sensor_reliability=reliability_models,
         )
 
     @property
@@ -85,8 +103,12 @@ class TestLabModelBundle:
             if self.weather is not None
             else "fallback"
         )
-        return "risk={};policy={};weather={}".format(
-            risk_version, policy_version, weather_version
+        sensor_versions = ",".join(
+            "{}={}".format(name.lower(), model.get("model_version", "unknown"))
+            for name, model in sorted(self.sensor_reliability.items())
+        ) or "fallback"
+        return "risk={};policy={};weather={};sensors={}".format(
+            risk_version, policy_version, weather_version, sensor_versions
         )
 
 
@@ -237,6 +259,9 @@ class TestLabInferenceEngine:
             risk,
         )
         target_speed = self._target_speed(message, executed_action)
+        sensor_reliability, overall_sensor_reliability, sensor_safety_mode = (
+            self._predict_sensor_reliability(message)
+        )
 
         return self._response(
             session_id,
@@ -257,7 +282,83 @@ class TestLabInferenceEngine:
             weather_model_used=weather_model_used,
             weather_speed_factor=weather_speed_factor,
             weather_target_speed_mps=weather_target_speed_mps,
+            sensor_reliability=sensor_reliability,
+            overall_sensor_reliability=overall_sensor_reliability,
+            sensor_safety_mode=sensor_safety_mode,
         )
+
+    def _predict_sensor_reliability(
+        self, message: Mapping[str, Any]
+    ) -> Tuple[list, float, str]:
+        raw_health = message.get("sensorHealth", [])
+        if not isinstance(raw_health, list) or not self.models.sensor_reliability:
+            return [], 1.0, "UNAVAILABLE"
+
+        camel_to_snake = {
+            "dropoutRate": "dropout_rate",
+            "messageAgeMean": "message_age_mean",
+            "messageAgeMax": "message_age_max",
+            "detectionCountMean": "detection_count_mean",
+            "detectionCountStd": "detection_count_std",
+            "confidenceMean": "confidence_mean",
+            "confidenceStd": "confidence_std",
+            "trackContinuity": "track_continuity",
+            "rangeVariance": "range_variance",
+            "velocityVariance": "velocity_variance",
+            "innovationMean": "innovation_mean",
+            "innovationStd": "innovation_std",
+            "crossSensorDisagreement": "cross_sensor_disagreement",
+            "egoSpeedMean": "ego_speed_mean",
+            "egoSpeedStd": "ego_speed_std",
+            "yawRateMean": "yaw_rate_mean",
+            "yawRateStd": "yaw_rate_std",
+        }
+        decisions = []
+        values = []
+        for item in raw_health:
+            if not isinstance(item, Mapping):
+                continue
+            sensor_type = str(item.get("sensorType", "")).strip().upper()
+            artifact = self.models.sensor_reliability.get(sensor_type)
+            if artifact is None:
+                continue
+            observation = {
+                snake: item.get(camel)
+                for camel, snake in camel_to_snake.items()
+            }
+            observation["weather"] = item.get("weather", message.get("weather", "Dry"))
+            result = predict_sensor_reliability(artifact, observation)
+            reliability = float(result["reliability"])
+            values.append(reliability)
+            decisions.append(
+                {
+                    "sensorId": str(item.get("sensorId", sensor_type.lower())),
+                    "sensorType": sensor_type,
+                    "reliability": reliability,
+                    "status": str(result["status"]),
+                }
+            )
+
+        if not values:
+            return [], 1.0, "UNAVAILABLE"
+
+        ordered = sorted(values)
+        median = ordered[len(ordered) // 2]
+        weakest = ordered[0]
+        # The median rewards sensor redundancy; the smaller weakest-sensor term
+        # still makes a single failed channel visible as a cautious condition.
+        overall = max(0.0, min(1.0, 0.75 * median + 0.25 * weakest))
+        healthy = sum(value >= 0.70 for value in values)
+        usable = sum(value >= 0.40 for value in values)
+        if healthy == len(values):
+            safety_mode = "NORMAL"
+        elif healthy >= 2:
+            safety_mode = "CAUTIOUS"
+        elif usable >= 1:
+            safety_mode = "RESTRICTED"
+        else:
+            safety_mode = "MINIMAL_RISK"
+        return decisions, overall, safety_mode
 
     def _build_state(self, message: Mapping[str, Any]) -> Dict[str, float]:
         ego = message.get("ego")
@@ -463,6 +564,9 @@ class TestLabInferenceEngine:
             "weather_model_used": "weatherModelUsed",
             "weather_speed_factor": "weatherSpeedFactor",
             "weather_target_speed_mps": "weatherTargetSpeedMps",
+            "sensor_reliability": "sensorReliability",
+            "overall_sensor_reliability": "overallSensorReliability",
+            "sensor_safety_mode": "sensorSafetyMode",
         }
         for key, value in values.items():
             response[camel_names.get(key, key)] = value
@@ -476,3 +580,13 @@ def default_model_paths(project_root: Path) -> Tuple[Path, Path, Path]:
         root / "ML" / "models" / "policy_model.joblib",
         root / "ML" / "models" / "weather_model.joblib",
     )
+
+
+def default_sensor_model_paths(project_root: Path) -> Dict[str, Path]:
+    root = Path(project_root).expanduser().resolve()
+    model_root = root / "ML" / "models"
+    return {
+        "CAMERA": model_root / "sensor_camera_reliability_model.joblib",
+        "LIDAR": model_root / "sensor_lidar_reliability_model.joblib",
+        "RADAR": model_root / "sensor_radar_reliability_model.joblib",
+    }

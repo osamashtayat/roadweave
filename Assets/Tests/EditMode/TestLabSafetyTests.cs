@@ -30,6 +30,35 @@ public class TestLabSafetyTests
     }
 
     [Test]
+    public void MlDecisionJsonCarriesVirtualSensorReliability()
+    {
+        const string json =
+            "{\"valid\":true,\"executedAction\":\"KEEP\"," +
+            "\"overallSensorReliability\":0.73,\"sensorSafetyMode\":\"CAUTIOUS\"," +
+            "\"sensorReliability\":[{\"sensorId\":\"front_camera\"," +
+            "\"sensorType\":\"CAMERA\",\"reliability\":0.44,\"status\":\"DEGRADED\"}]}";
+
+        Type decisionType = FindRuntimeType("TestLabMlDecision");
+        object decision = JsonUtility.FromJson(json, decisionType);
+
+        Assert.That(
+            (float)decisionType.GetField("overallSensorReliability").GetValue(decision),
+            Is.EqualTo(0.73f).Within(0.001f)
+        );
+        Assert.That(
+            (string)decisionType.GetField("sensorSafetyMode").GetValue(decision),
+            Is.EqualTo("CAUTIOUS")
+        );
+        Array sensors = (Array)decisionType.GetField("sensorReliability").GetValue(decision);
+        Assert.That(sensors.Length, Is.EqualTo(1));
+        object camera = sensors.GetValue(0);
+        Assert.That(
+            (string)camera.GetType().GetField("status").GetValue(camera),
+            Is.EqualTo("DEGRADED")
+        );
+    }
+
+    [Test]
     public void WeatherRangeFactorChangesActiveSensorRange()
     {
         GameObject root = new GameObject("SensorTest");

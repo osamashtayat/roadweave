@@ -49,6 +49,42 @@ def weather_artifact(value=0.62):
     }
 
 
+def reliability_artifact(sensor_type, value):
+    return {
+        "schema_version": "roadweave.sensor-reliability/1.0",
+        "task": "sensor_reliability",
+        "sensor_type": sensor_type,
+        "feature_columns": ["dropout_rate", "weather_dry"],
+        "model": ConstantRegressionModel(value),
+        "model_version": "{}-test".format(sensor_type.lower()),
+    }
+
+
+def sensor_health(sensor_type, sensor_id, dropout=0.02):
+    return {
+        "sensorId": sensor_id,
+        "sensorType": sensor_type,
+        "weather": "Dry",
+        "dropoutRate": dropout,
+        "messageAgeMean": 0.08,
+        "messageAgeMax": 0.1,
+        "detectionCountMean": 2.0,
+        "detectionCountStd": 0.1,
+        "confidenceMean": 0.95,
+        "confidenceStd": 0.02,
+        "trackContinuity": 0.95,
+        "rangeVariance": 1.0,
+        "velocityVariance": 0.2,
+        "innovationMean": 0.1,
+        "innovationStd": 0.05,
+        "crossSensorDisagreement": 0.2,
+        "egoSpeedMean": 8.0,
+        "egoSpeedStd": 0.1,
+        "yawRateMean": 0.0,
+        "yawRateStd": 0.2,
+    }
+
+
 def message(sequence=1, action_lane="RIGHT"):
     return {
         "schemaVersion": PROTOCOL_VERSION,
@@ -166,6 +202,47 @@ class TestLabInferenceTests(unittest.TestCase):
         self.assertEqual(response["weatherContext"], "Dry")
         self.assertAlmostEqual(response["weatherSpeedFactor"], 1.0)
         self.assertAlmostEqual(response["weatherTargetSpeedMps"], 10.0)
+
+    def test_three_sensor_reliability_predictions_are_returned(self):
+        engine = self.engine()
+        engine.models.sensor_reliability = {
+            "CAMERA": reliability_artifact("CAMERA", 0.82),
+            "LIDAR": reliability_artifact("LIDAR", 0.91),
+            "RADAR": reliability_artifact("RADAR", 0.88),
+        }
+        request = message()
+        request["sensorHealth"] = [
+            sensor_health("Camera", "front_camera"),
+            sensor_health("Lidar", "roof_lidar"),
+            sensor_health("Radar", "front_radar"),
+        ]
+
+        response = engine.handle(request)
+
+        self.assertTrue(response["valid"])
+        self.assertEqual(len(response["sensorReliability"]), 3)
+        self.assertEqual(response["sensorSafetyMode"], "NORMAL")
+        self.assertAlmostEqual(response["overallSensorReliability"], 0.865)
+
+    def test_redundancy_allows_cautious_operation_when_camera_fails(self):
+        engine = self.engine()
+        engine.models.sensor_reliability = {
+            "CAMERA": reliability_artifact("CAMERA", 0.15),
+            "LIDAR": reliability_artifact("LIDAR", 0.90),
+            "RADAR": reliability_artifact("RADAR", 0.86),
+        }
+        request = message()
+        request["sensorHealth"] = [
+            sensor_health("Camera", "front_camera", 0.9),
+            sensor_health("Lidar", "roof_lidar"),
+            sensor_health("Radar", "front_radar"),
+        ]
+
+        response = engine.handle(request)
+
+        self.assertEqual(response["sensorSafetyMode"], "CAUTIOUS")
+        self.assertGreater(response["overallSensorReliability"], 0.60)
+        self.assertLess(response["overallSensorReliability"], 0.86)
 
 
 if __name__ == "__main__":

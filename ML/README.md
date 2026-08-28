@@ -5,7 +5,8 @@ trajectories into a shared observation format, trains the risk and maneuver
 models, and optionally uses those models inside the RoadWeave procedural live
 stream. A third, independent weather-speed model is trained from the Extreme
 Driving Conditions Dataset and is used by the Unity Test Lab for rain, snow,
-and fog.
+and fog. Three additional regressors estimate the reliability of RoadWeave's
+object-level virtual camera, LiDAR, and radar from rolling health features.
 
 The Unity project is not coupled to pandas, Parquet, scikit-learn, or either
 training dataset. Unity still receives the same `TwinSnapshot` UDP messages.
@@ -36,6 +37,12 @@ Extreme Driving episode tars --> build_extreme_weather.py
                                           weather_model (speed factor)
                                                     |
 Unity Test Lab observation --> test_lab_ml_service.py --> Unity controller
+
+Unity actor truth --> virtual camera/LiDAR/radar --> fused observation
+                              |                         |
+                              +--> rolling health -----+
+                                        |
+                camera/LiDAR/radar reliability models --> safety mode
 ```
 
 Each training row has source/group metadata, one target, and 210 canonical
@@ -82,6 +89,9 @@ python ML/src/train_model.py --task policy
 
 python ML/src/build_extreme_weather.py
 python ML/src/train_weather_model.py
+
+python ML/src/generate_sensor_reliability.py
+python ML/src/train_sensor_reliability.py
 
 python ML/src/test_prediction.py --task risk
 python ML/src/test_prediction.py --task policy
@@ -135,7 +145,9 @@ python Tools/test_lab_ml_service.py
 ```
 
 The service listens on `127.0.0.1:5075` (override with `--host`/`--port`) and
-answers the versioned `roadweave.testlab-ml/1.0` protocol. While it runs, the
+answers the versioned `roadweave.testlab-ml/1.0` protocol. It loads the risk,
+policy, weather, camera-reliability, LiDAR-reliability, and radar-reliability
+artifacts. While it runs, the
 Test Lab's `TestLabMlDecisionBridge` requests a decision at 5 Hz and feeds the
 returned target speed, requested lane change, and learned adverse-weather speed
 cap into `AutonomousTestVehicleController`. Rain, snow, and fog use the
@@ -146,6 +158,26 @@ test. The model's normalized output is converted back through its 50 km/h
 training reference into an absolute target speed. Unity then smooths the
 corresponding factor and clips it to 0.35–1.0; weather alone therefore cannot
 command a complete stop.
+
+The Test Lab vehicle also creates an object-level virtual camera (15 Hz),
+LiDAR (10 Hz), and radar (20 Hz). Each channel has different range, latency,
+noise, weather sensitivity, and injected fault behavior. Their observations
+are confidence-fused before the risk/policy models see them. A rolling
+three-second window supplies dropout, freshness, confidence, continuity,
+variance, innovation, disagreement, ego-motion, and weather features to the
+three reliability regressors. The service returns per-sensor scores plus one
+redundancy-aware safety mode:
+
+- `NORMAL`: all available channels are acceptable;
+- `CAUTIOUS`: at least two channels remain acceptable;
+- `RESTRICTED`: only limited sensing remains, so speed is capped and new
+  overtakes are rejected;
+- `MINIMAL_RISK`: no usable channel remains, so the prototype stops.
+
+The learned policy and lane planner consume the noisy fused observations. The
+uncorrupted Unity actor scan is retained only as the final collision envelope;
+this keeps the research prototype safe without leaking perfect information
+into the learned decisions.
 
 For the risky-driver demonstration, press **Create Test** and then the runtime
 **Risk Driving** button. The simulated driver requests 80 km/h while the ML
@@ -194,8 +226,12 @@ and the limitations that matter before presenting or publishing this baseline.
 - `src/build_extreme_weather.py`: streaming Extreme Driving tar converter
 - `src/train_weather_model.py`: group-separated weather regressor training/evaluation
 - `src/weather_model.py`: weather artifact validation and inference helper
+- `src/sensor_reliability_features.py`: canonical virtual-sensor health contract
+- `src/generate_sensor_reliability.py`: reproducible fault-injection data generator
+- `src/train_sensor_reliability.py`: one group-split reliability regressor per sensor
+- `src/sensor_reliability_model.py`: reliability artifact validation and inference
 - `Tools/benchmark_controllers.py`: rule-vs-ML safety/comfort comparison
-- `Tools/test_lab_ml_service.py`: local risk/policy/weather service for Unity
+- `Tools/test_lab_ml_service.py`: local decision, weather, and reliability service
 - `tests/`: feature, splitting, safety, and runtime unit tests
 
 ## Transition to a future sensor gateway
@@ -207,3 +243,8 @@ object, adjacent front/rear objects, pedestrian, and lane-clear flags). The
 three-second summarizer and saved model interface can then remain unchanged.
 Unity remains downstream of `TwinSnapshot`, so replacing the Python simulator
 does not require Unity to understand the training datasets or model library.
+The reliability models have the same boundary: a gateway may publish the
+optional `sensorHealth` contract after computing equivalent health statistics.
+The current regressors are trained only on RoadWeave virtual-sensor faults,
+however, so they must be validated or retrained with hardware fault-injection
+data before their scores are interpreted as real sensor reliability.
