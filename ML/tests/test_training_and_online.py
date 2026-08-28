@@ -4,9 +4,9 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 
-from ML.src.model_support import normalize_target
+from ML.src.model_support import assess_ood, build_ood_profile, normalize_target
 from ML.src.online_policy import OnlineModelBundle, RoadWeaveMLController
-from ML.src.train_model import best_group_holdout
+from ML.src.train_model import balanced_sample_weights, best_group_holdout
 
 
 class ConstantProbabilityModel:
@@ -71,6 +71,26 @@ class GroupSplitTests(unittest.TestCase):
     def test_numeric_and_named_targets_normalize_identically(self):
         self.assertEqual(normalize_target(2, "policy"), "DECELERATE")
         self.assertEqual(normalize_target("DrivingAction.DECELERATE", "policy"), "DECELERATE")
+
+    def test_source_class_weights_equalize_cell_totals(self):
+        data = pd.DataFrame(
+            {
+                "source": ["a", "a", "a", "b"],
+                "target": ["LOW", "LOW", "HIGH", "LOW"],
+            }
+        )
+        weights = balanced_sample_weights(data)
+        totals = {}
+        for source, target, weight in zip(data["source"], data["target"], weights):
+            totals[(source, target)] = totals.get((source, target), 0.0) + weight
+        self.assertAlmostEqual(max(totals.values()), min(totals.values()))
+
+    def test_ood_profile_flags_far_outside_observation(self):
+        data = pd.DataFrame({"ego_speed_now": np.linspace(0.0, 20.0, 200)})
+        artifact_data = {"ood_profile": build_ood_profile(data, ["ego_speed_now"])}
+        is_ood, score, threshold = assess_ood(artifact_data, {"ego_speed_now": 200.0})
+        self.assertTrue(is_ood)
+        self.assertGreater(score, threshold)
 
 
 class OnlineSafetyTests(unittest.TestCase):

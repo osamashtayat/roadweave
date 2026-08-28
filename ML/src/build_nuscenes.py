@@ -40,8 +40,6 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
-from nuscenes.can_bus.can_bus_api import NuScenesCanBus
-from nuscenes.nuscenes import NuScenes
 from pyquaternion import Quaternion
 
 
@@ -52,7 +50,15 @@ if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 
 from features import BASE_SIGNALS, new_state, set_slot, summarize_history  # noqa: E402
-from labels import ACTION_NAMES, DrivingAction, RISK_NAMES, RiskLevel  # noqa: E402
+from common_labels import (  # noqa: E402
+    policy_label_from_future_motion,
+    risk_label_from_future,
+)
+from labels import ACTION_NAMES, RISK_NAMES  # noqa: E402
+from nuscenes_lite import NuScenesCanBusLite, NuScenesLite  # noqa: E402
+
+NuScenes = NuScenesLite
+NuScenesCanBus = NuScenesCanBusLite
 
 
 DEFAULT_DATAROOT = Path("/Users/asus/Downloads/v1.0-trainval")
@@ -67,7 +73,17 @@ FEATURE_COLUMNS = tuple(
     for signal in BASE_SIGNALS
     for suffix in SUMMARY_SUFFIXES
 )
-METADATA_COLUMNS = ("source", "group_id", "timestamp", "target")
+METADATA_COLUMNS = (
+    "source",
+    "domain",
+    "group_id",
+    "timestamp",
+    "target",
+    "label_origin",
+    "history_seconds",
+    "future_seconds",
+    "sampling_hz",
+)
 OUTPUT_COLUMNS = METADATA_COLUMNS + FEATURE_COLUMNS
 
 # nuScenes uses x forward, y left, z up in the ego coordinate frame.
@@ -132,9 +148,14 @@ class IncrementalParquetWriter:
         self.schema = pa.schema(
             [
                 pa.field("source", pa.string(), nullable=False),
+                pa.field("domain", pa.string(), nullable=False),
                 pa.field("group_id", pa.string(), nullable=False),
                 pa.field("timestamp", pa.float64(), nullable=False),
                 pa.field("target", pa.string(), nullable=False),
+                pa.field("label_origin", pa.string(), nullable=False),
+                pa.field("history_seconds", pa.float64(), nullable=False),
+                pa.field("future_seconds", pa.float64(), nullable=False),
+                pa.field("sampling_hz", pa.float64(), nullable=False),
             ]
             + [pa.field(column, pa.float64()) for column in FEATURE_COLUMNS]
         )
@@ -142,7 +163,7 @@ class IncrementalParquetWriter:
             str(self.path),
             self.schema,
             compression="zstd",
-            use_dictionary=("source", "group_id", "target"),
+            use_dictionary=("source", "domain", "group_id", "target", "label_origin"),
         )
         self.row_count = 0
 
@@ -486,9 +507,15 @@ def _build_ego_frame(
     if can_pose is None:
         return None
 
-    ego_pose = _ego_pose_for_sample(nusc, sample)
-    ego_position = np.asarray(ego_pose["translation"], dtype=np.float64)
-    ego_orientation = Quaternion(ego_pose["rotation"])
+    # CAN pose already contains the global vehicle position and orientation at
+    # high frequency.  Using the matched pose avoids depending on the optional
+    # sample_data metadata table while retaining the same global coordinate
+    # frame as nuScenes annotations.
+    ego_position = np.asarray(can_pose.get("pos", []), dtype=np.float64)
+    ego_orientation_values = can_pose.get("orientation", [])
+    if ego_position.shape != (3,) or len(ego_orientation_values) != 4:
+        return None
+    ego_orientation = Quaternion(ego_orientation_values)
 
     can_velocity = np.asarray(can_pose.get("vel", []), dtype=np.float64)
     can_acceleration = np.asarray(can_pose.get("accel", []), dtype=np.float64)
@@ -670,17 +697,7 @@ def _policy_target(
     future measurement enters the feature dictionary.
     """
 
-    if lateral_displacement > 1.4:
-        action = DrivingAction.CHANGE_LEFT
-    elif lateral_displacement < -1.4:
-        action = DrivingAction.CHANGE_RIGHT
-    elif speed_change > 1.0:
-        action = DrivingAction.ACCELERATE
-    elif speed_change < -1.0:
-        action = DrivingAction.DECELERATE
-    else:
-        action = DrivingAction.KEEP
-    return ACTION_NAMES[action]
+    return policy_label_from_future_motion(speed_change, lateral_displacement)
 
 
 def _minimum_present_value(
@@ -708,63 +725,31 @@ def _risk_level(
     that otherwise lets the risk model learn dataset identity instead of risk.
     """
 
-    if any(frame.has_overlap for frame in history_frames):
-        return RISK_NAMES[RiskLevel.EXTREME]
-
-    accelerations = [
-        abs(float(state["ego_accel"]))
-        for state in history_states
-        if _finite(state.get("ego_accel"))
-    ]
-    max_abs_accel = max(accelerations) if accelerations else 0.0
-
-    minimum_front_ttc = _minimum_present_value(history_states, "front_ttc")
-    minimum_pedestrian_gap = _minimum_present_value(history_states, "pedestrian_gap")
-
-    if minimum_front_ttc is not None and minimum_front_ttc <= 1.5:
-        return RISK_NAMES[RiskLevel.EXTREME]
-    if minimum_pedestrian_gap is not None and minimum_pedestrian_gap <= 3.0:
-        return RISK_NAMES[RiskLevel.EXTREME]
-
-    if max_abs_accel >= 4.0:
-        return RISK_NAMES[RiskLevel.HIGH]
-    if minimum_front_ttc is not None and minimum_front_ttc <= 3.0:
-        return RISK_NAMES[RiskLevel.HIGH]
-    if minimum_pedestrian_gap is not None and minimum_pedestrian_gap <= 8.0:
-        return RISK_NAMES[RiskLevel.HIGH]
-
-    if max_abs_accel >= 2.5:
-        return RISK_NAMES[RiskLevel.MODERATE]
-    if minimum_front_ttc is not None and minimum_front_ttc <= 5.0:
-        return RISK_NAMES[RiskLevel.MODERATE]
-    if minimum_pedestrian_gap is not None and minimum_pedestrian_gap <= 15.0:
-        return RISK_NAMES[RiskLevel.MODERATE]
-
-    # A present actor with unknown TTC is not confidently LOW-risk when it is
-    # already close. Keep uncertainty out of the low-risk reference set.
-    for state in history_states:
-        if (
-            state.get("front_present", 0.0) >= 0.5
-            and _finite(state.get("front_gap"))
-            and float(state["front_gap"]) < 20.0
-            and not _finite(state.get("front_ttc"))
-        ):
-            return RISK_NAMES[RiskLevel.MODERATE]
-
-    return RISK_NAMES[RiskLevel.LOW]
+    return risk_label_from_future(
+        history_states,
+        [frame.has_overlap for frame in history_frames],
+    )
 
 
 def _output_row(
     scene_name: str,
+    domain: str,
     timestamp_seconds: float,
     target: str,
     features: Mapping[str, float],
+    history_seconds: float,
+    future_seconds: float,
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = {
         "source": "nuscenes",
+        "domain": domain,
         "group_id": scene_name,
         "timestamp": float(timestamp_seconds),
         "target": target,
+        "label_origin": "observed_future",
+        "history_seconds": float(history_seconds),
+        "future_seconds": float(future_seconds),
+        "sampling_hz": 2.0,
     }
     for column in FEATURE_COLUMNS:
         row[column] = features.get(column, float("nan"))
@@ -777,11 +762,15 @@ def _process_scene(
     scene: Mapping[str, Any],
     history_seconds: float,
     future_seconds: float,
+    risk_future_seconds: float,
     timestamp_tolerance_seconds: float,
     maximum_can_difference_seconds: float,
     statistics: BuildStatistics,
 ) -> Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
     scene_name = str(scene["name"])
+    log_record = nusc.get("log", scene["log_token"])
+    location = str(log_record.get("location", "unknown")).strip().lower()
+    domain = "nuscenes_{}".format(location.replace("-", "_").replace(" ", "_"))
     try:
         can_pose_messages = can_bus.get_messages(
             scene_name,
@@ -852,21 +841,35 @@ def _process_scene(
             continue
 
         history_start = current.timestamp_seconds - history_seconds
-        history_frames = [
-            frame
-            for frame in frames[: index + 1]
-            if frame is not None and frame.timestamp_seconds >= history_start
-        ]
         features = summarize_history(history_states)
 
-        risk_rows.append(
-            _output_row(
-                scene_name,
-                current.timestamp_seconds,
-                _risk_level(history_states, history_frames),
-                features,
-            )
+        risk_future_index = _future_index(
+            frames,
+            relative_timestamps,
+            index,
+            risk_future_seconds,
+            timestamp_tolerance_seconds,
         )
+        if risk_future_index is not None:
+            risk_future_frames = [
+                frame
+                for frame in frames[index : risk_future_index + 1]
+                if frame is not None
+            ]
+            risk_rows.append(
+                _output_row(
+                    scene_name,
+                    domain,
+                    current.timestamp_seconds,
+                    _risk_level(
+                        [frame.state for frame in risk_future_frames],
+                        risk_future_frames,
+                    ),
+                    features,
+                    history_seconds,
+                    risk_future_seconds,
+                )
+            )
 
         future_index = _future_index(
             frames,
@@ -909,9 +912,12 @@ def _process_scene(
         policy_rows.append(
             _output_row(
                 scene_name,
+                domain,
                 current.timestamp_seconds,
                 target,
                 features,
+                history_seconds,
+                future_seconds,
             )
         )
 
@@ -1029,8 +1035,9 @@ def _parse_arguments() -> argparse.Namespace:
         default=None,
         help="Process at most N selected scenes (use 1 for a smoke test).",
     )
-    parser.add_argument("--history-seconds", type=float, default=3.0)
-    parser.add_argument("--future-seconds", type=float, default=3.0)
+    parser.add_argument("--history-seconds", type=float, default=1.0)
+    parser.add_argument("--future-seconds", type=float, default=1.0)
+    parser.add_argument("--risk-future-seconds", type=float, default=1.0)
     parser.add_argument(
         "--timestamp-tolerance-seconds",
         type=float,
@@ -1069,6 +1076,8 @@ def _validate_arguments(arguments: argparse.Namespace) -> None:
         raise ValueError("--history-seconds must be greater than zero.")
     if arguments.future_seconds <= 0.0:
         raise ValueError("--future-seconds must be greater than zero.")
+    if arguments.risk_future_seconds <= 0.0:
+        raise ValueError("--risk-future-seconds must be greater than zero.")
     if arguments.timestamp_tolerance_seconds < 0.0:
         raise ValueError("--timestamp-tolerance-seconds cannot be negative.")
     if arguments.max_can_time_difference_seconds <= 0.0:
@@ -1145,6 +1154,7 @@ def main() -> None:
                     scene,
                     arguments.history_seconds,
                     arguments.future_seconds,
+                    arguments.risk_future_seconds,
                     arguments.timestamp_tolerance_seconds,
                     arguments.max_can_time_difference_seconds,
                     statistics,

@@ -44,6 +44,8 @@ public sealed class TestLabMlDecision
         Array.Empty<VirtualSensorReliabilityDecision>();
     public float overallSensorReliability = 1f;
     public string sensorSafetyMode;
+    public bool outOfDistribution;
+    public float oodScore;
     public string error;
 
     public TestLabMlAction Action => ParseAction(executedAction);
@@ -134,6 +136,8 @@ public sealed class TestLabMlDecisionBridge : MonoBehaviour
             }
             if (!string.IsNullOrWhiteSpace(latestDecision.overrideReason))
                 summary += $" ({latestDecision.overrideReason})";
+            if (latestDecision.outOfDistribution)
+                summary += $", OOD {latestDecision.oodScore:P0}";
             return summary;
         }
     }

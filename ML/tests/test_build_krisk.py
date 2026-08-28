@@ -141,16 +141,17 @@ class KRiskConverterTests(unittest.TestCase):
     def test_highd_conversion_excludes_risk_and_behaviour_labels(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / (
-                "highd_1_10_preceding_brake_high_frame_100_to_103.json"
+                "highd_1_10_preceding_brake_high_frame_100_to_150.json"
             )
             records = []
-            for frame in range(100, 104):
+            for frame in range(100, 151):
+                elapsed = (frame - 100) / 25.0
                 records.extend(
                     [
                         {
                             "frame": frame,
                             "id": 10,
-                            "x": float(frame - 100),
+                            "x": 20.0 * elapsed,
                             "y": 0.0,
                             "width": 4.0,
                             "xVelocity": 20.0,
@@ -168,14 +169,14 @@ class KRiskConverterTests(unittest.TestCase):
                             "rightFollowingId": 0,
                             "total_risk": float(frame),
                             "acc_high": False,
-                            "brake_high": frame == 103,
+                            "brake_high": frame == 125,
                             "yaw_left": False,
                             "yaw_right": False,
                         },
                         {
                             "frame": frame,
                             "id": 11,
-                            "x": float(frame - 80),
+                            "x": 20.0 + 15.0 * elapsed,
                             "y": 0.0,
                             "width": 4.0,
                             "xVelocity": 15.0,
@@ -196,12 +197,14 @@ class KRiskConverterTests(unittest.TestCase):
                     "schema": "highd",
                     "severity": "HIGH",
                 },
-                history_seconds=3.0,
+                history_seconds=1.0,
             )
 
-            self.assertEqual(row["target"], "HIGH")
+            self.assertIn(row["target"], {"MODERATE", "HIGH", "EXTREME"})
             self.assertEqual(row["source"], "krisk")
-            self.assertEqual(audit["peak_frame"], 103)
+            self.assertEqual(row["domain"], "highd")
+            self.assertEqual(audit["anchor_frame"], 125)
+            self.assertEqual(audit["policy_target"], "KEEP")
             self.assertEqual(row["front_present_now"], 1.0)
             self.assertGreater(row["front_closing_speed_now"], 0.0)
             self.assertFalse(any("risk" in name.lower() for name in row))

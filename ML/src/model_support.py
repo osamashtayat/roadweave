@@ -10,7 +10,7 @@ import pandas as pd
 import sklearn
 
 
-SCHEMA_VERSION = "roadweave.ml-observation/1.0"
+SCHEMA_VERSION = "roadweave.ml-observation/2.0"
 
 TASK_LABELS: Dict[str, Tuple[str, ...]] = {
     "risk": ("LOW", "MODERATE", "HIGH", "EXTREME"),
@@ -30,6 +30,7 @@ TASK_FILES: Dict[str, Tuple[str, ...]] = {
 
 METADATA_COLUMNS = {
     "source",
+    "domain",
     "group_id",
     "timestamp",
     "target",
@@ -38,6 +39,11 @@ METADATA_COLUMNS = {
     "event_id",
     "split",
     "_split_group",
+    "_split_domain",
+    "label_origin",
+    "history_seconds",
+    "future_seconds",
+    "sampling_hz",
 }
 
 # These fields are labels, future information, or source-specific shortcuts.
@@ -161,8 +167,12 @@ def load_task_data(
         frame = frame.copy()
         frame["target"] = normalize_targets(frame["target"].tolist(), task).to_numpy()
         frame["source"] = frame["source"].astype(str).str.strip().str.lower()
+        if "domain" not in frame.columns:
+            frame["domain"] = frame["source"]
+        frame["domain"] = frame["domain"].astype(str).str.strip().str.lower()
         frame["group_id"] = frame["group_id"].astype(str).str.strip()
         frame["_split_group"] = frame["source"] + "::" + frame["group_id"]
+        frame["_split_domain"] = frame["domain"]
         frames.append(frame)
 
     combined = pd.concat(frames, ignore_index=True, sort=False)
@@ -199,11 +209,140 @@ def select_feature_columns(data: pd.DataFrame) -> Tuple[List[str], List[str]]:
     return selected, rejected
 
 
+def select_transfer_feature_columns(
+    data: pd.DataFrame,
+) -> Tuple[List[str], List[str]]:
+    """Select comparable physical summaries shared by nuScenes and K-Risk.
+
+    K-Risk contains no pedestrians, so pedestrian features are supervised only
+    by nuScenes and perfectly reveal dataset identity. Pedestrian emergency
+    handling remains in RoadWeave's deterministic safety supervisor. We also
+    remove transition-frequency summaries of binary occupancy flags and retain
+    compact, interpretable history statistics for continuous measurements.
+    """
+
+    all_features, rejected = select_feature_columns(data)
+    selected: List[str] = []
+    profile_rejected: List[str] = []
+    for column in all_features:
+        if column.startswith("pedestrian_"):
+            profile_rejected.append(column)
+            continue
+        if column.startswith(("ego_speed_", "ego_accel_", "ego_yaw_rate_")):
+            selected.append(column)
+            continue
+        if column.startswith(("left_clear_", "right_clear_")):
+            if column.endswith(("_now", "_mean")):
+                selected.append(column)
+            else:
+                profile_rejected.append(column)
+            continue
+        if "_present_" in column:
+            if column.endswith(("_now", "_mean")):
+                selected.append(column)
+            else:
+                profile_rejected.append(column)
+            continue
+        if "_gap_" in column:
+            allowed = column.endswith(("_now", "_min", "_mean"))
+        elif "_closing_speed_" in column:
+            allowed = column.endswith(("_now", "_max", "_mean"))
+        elif "_ttc_" in column:
+            allowed = column.endswith(("_now", "_min", "_mean"))
+        elif "_speed_" in column:
+            allowed = column.endswith(("_now", "_mean"))
+        else:
+            allowed = False
+        if allowed:
+            selected.append(column)
+        else:
+            profile_rejected.append(column)
+
+    if not selected:
+        raise ValueError("The transfer feature profile selected no columns.")
+    return selected, rejected + profile_rejected
+
+
 def clean_feature_frame(data: pd.DataFrame, feature_columns: Sequence[str]) -> pd.DataFrame:
     aligned = data.reindex(columns=list(feature_columns)).copy()
     for column in feature_columns:
         aligned[column] = pd.to_numeric(aligned[column], errors="coerce")
     return aligned.replace([np.inf, -np.inf], np.nan).astype(np.float64)
+
+
+def build_ood_profile(
+    data: pd.DataFrame,
+    feature_columns: Sequence[str],
+) -> Dict[str, Any]:
+    """Build a compact training-envelope profile for runtime protection."""
+
+    frame = clean_feature_frame(data, feature_columns)
+    profile_features: Dict[str, Dict[str, float]] = {}
+    for column in feature_columns:
+        values = frame[column]
+        finite = values.dropna()
+        if finite.empty:
+            continue
+        profile_features[column] = {
+            "lower": float(finite.quantile(0.005)),
+            "upper": float(finite.quantile(0.995)),
+            "missing_rate": float(values.isna().mean()),
+        }
+
+    row_scores = [
+        _ood_score_from_profile(row, profile_features)
+        for _, row in frame.iterrows()
+    ]
+    threshold = float(np.quantile(row_scores, 0.99)) if row_scores else 1.0
+    # A few marginal sensor values must not trigger fallback.  The guard is
+    # intended for observations that differ substantially from all training
+    # domains, not for ordinary measurement noise.
+    threshold = min(0.50, max(0.20, threshold))
+    return {
+        "method": "feature-envelope/1.0",
+        "threshold": threshold,
+        "features": profile_features,
+    }
+
+
+def _ood_score_from_profile(
+    values: Mapping[str, Any],
+    feature_profiles: Mapping[str, Mapping[str, float]],
+) -> float:
+    penalties: List[float] = []
+    for column, profile in feature_profiles.items():
+        value = values.get(column, np.nan)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = float("nan")
+
+        if not np.isfinite(number):
+            # Missing values are expected for absent actors. Penalize them only
+            # when the feature was almost always measured during training.
+            penalties.append(1.0 if float(profile["missing_rate"]) < 0.02 else 0.0)
+            continue
+        lower = float(profile["lower"])
+        upper = float(profile["upper"])
+        penalties.append(1.0 if number < lower or number > upper else 0.0)
+    return float(np.mean(penalties)) if penalties else 1.0
+
+
+def assess_ood(
+    artifact: Mapping[str, Any],
+    features: Mapping[str, Any],
+) -> Tuple[bool, float, float]:
+    """Return (outside_training_domain, score, learned_threshold)."""
+
+    profile = artifact.get("ood_profile")
+    if not isinstance(profile, Mapping):
+        return False, 0.0, 1.0
+    feature_profiles = profile.get("features")
+    if not isinstance(feature_profiles, Mapping):
+        return False, 0.0, 1.0
+    score = _ood_score_from_profile(features, feature_profiles)
+    threshold = float(profile.get("threshold", 1.0))
+    return score > threshold, score, threshold
 
 
 def load_artifact(path: Path, expected_task: Optional[str] = None) -> Dict[str, Any]:

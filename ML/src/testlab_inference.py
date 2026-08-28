@@ -19,7 +19,7 @@ import time
 
 try:
     from ML.src.features import new_state, set_slot, summarize_history
-    from ML.src.model_support import load_artifact, predict_one
+    from ML.src.model_support import assess_ood, load_artifact, predict_one
     from ML.src.weather_features import normalize_condition, summarize_weather_history
     from ML.src.weather_model import load_weather_artifact, predict_weather_factor
     from ML.src.sensor_reliability_model import (
@@ -28,7 +28,7 @@ try:
     )
 except ModuleNotFoundError:
     from features import new_state, set_slot, summarize_history  # type: ignore
-    from model_support import load_artifact, predict_one  # type: ignore
+    from model_support import assess_ood, load_artifact, predict_one  # type: ignore
     from weather_features import normalize_condition, summarize_weather_history  # type: ignore
     from weather_model import load_weather_artifact, predict_weather_factor  # type: ignore
     from sensor_reliability_model import (  # type: ignore
@@ -223,6 +223,10 @@ class TestLabInferenceEngine:
         summary = summarize_history(session.history)
         risk, risk_confidence, _ = predict_one(self.models.risk, summary)
         requested_action, action_confidence, _ = predict_one(self.models.policy, summary)
+        risk_ood, risk_ood_score, _ = assess_ood(self.models.risk, summary)
+        policy_ood, policy_ood_score, _ = assess_ood(self.models.policy, summary)
+        is_ood = risk_ood or policy_ood
+        ood_score = max(risk_ood_score, policy_ood_score)
 
         weather_context = normalize_condition(message.get("weather", "Dry"))
         weather_model_used = (
@@ -257,6 +261,7 @@ class TestLabInferenceEngine:
             requested_action,
             action_confidence,
             risk,
+            is_ood,
         )
         target_speed = self._target_speed(message, executed_action)
         sensor_reliability, overall_sensor_reliability, sensor_safety_mode = (
@@ -285,6 +290,8 @@ class TestLabInferenceEngine:
             sensor_reliability=sensor_reliability,
             overall_sensor_reliability=overall_sensor_reliability,
             sensor_safety_mode=sensor_safety_mode,
+            out_of_distribution=is_ood,
+            ood_score=ood_score,
         )
 
     def _predict_sensor_reliability(
@@ -421,6 +428,7 @@ class TestLabInferenceEngine:
         requested_action: str,
         action_confidence: float,
         risk: str,
+        out_of_distribution: bool = False,
     ) -> Tuple[str, str]:
         emergency_reason = self._emergency_reason(message)
         if emergency_reason:
@@ -429,7 +437,10 @@ class TestLabInferenceEngine:
             return EMERGENCY_STOP, emergency_reason
 
         reason = ""
-        if action_confidence < self.confidence_threshold:
+        if out_of_distribution:
+            candidate = DECELERATE
+            reason = "observation outside training domain"
+        elif action_confidence < self.confidence_threshold:
             candidate = DECELERATE
             reason = "policy confidence below {:.2f}".format(self.confidence_threshold)
         elif risk == "EXTREME" and requested_action != DECELERATE:
@@ -567,6 +578,8 @@ class TestLabInferenceEngine:
             "sensor_reliability": "sensorReliability",
             "overall_sensor_reliability": "overallSensorReliability",
             "sensor_safety_mode": "sensorSafetyMode",
+            "out_of_distribution": "outOfDistribution",
+            "ood_score": "oodScore",
         }
         for key, value in values.items():
             response[camel_names.get(key, key)] = value

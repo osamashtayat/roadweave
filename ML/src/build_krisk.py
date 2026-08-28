@@ -36,6 +36,10 @@ SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 
+from common_labels import (  # noqa: E402
+    policy_label_from_future_motion,
+    risk_label_from_future,
+)
 from features import new_state, set_slot, summarize_history  # noqa: E402
 from labels import ACTION_NAMES, KRISK_ACTION_MAP, DrivingAction  # noqa: E402
 
@@ -766,14 +770,16 @@ def build_states(
     ego_id: str,
     schema: str,
     source: str,
-    peak_frame: int,
+    anchor_frame: int,
     history_seconds: float,
+    future_seconds: float = 0.0,
 ) -> List[Dict[str, float]]:
     fields = record_fields(schema)
     frame_field = str(fields["frame"])
     id_field = str(fields["id"])
     fps = SOURCE_FPS[source.lower()]
-    first_allowed_frame = peak_frame - int(round(history_seconds * fps))
+    first_allowed_frame = anchor_frame - int(round(history_seconds * fps))
+    last_allowed_frame = anchor_frame + int(round(future_seconds * fps))
 
     by_frame: Dict[int, List[Mapping[str, object]]] = defaultdict(list)
     for record in records:
@@ -781,7 +787,7 @@ def build_states(
         if not math.isfinite(frame_number):
             continue
         frame = int(frame_number)
-        if first_allowed_frame <= frame <= peak_frame:
+        if first_allowed_frame <= frame <= last_allowed_frame:
             by_frame[frame].append(record)
 
     states: List[Dict[str, float]] = []
@@ -898,8 +904,122 @@ def build_states(
     return states
 
 
+def choose_observation_frame(
+    ego_records: Sequence[Mapping[str, object]],
+    fields: Mapping[str, object],
+    fps: float,
+    history_seconds: float,
+    future_seconds: float,
+    preferred_frame: Optional[int] = None,
+) -> int:
+    """Choose a real frame with enough measured past and future context."""
+
+    frame_field = str(fields["frame"])
+    frames = sorted(
+        {
+            int(finite_number(record.get(frame_field)))
+            for record in ego_records
+            if math.isfinite(finite_number(record.get(frame_field)))
+        }
+    )
+    if not frames:
+        raise ConversionError("Ego trajectory contains no finite frame IDs.")
+
+    lower = frames[0] + int(math.ceil(history_seconds * fps))
+    upper = frames[-1] - int(math.ceil(future_seconds * fps))
+    candidates = [frame for frame in frames if lower <= frame <= upper]
+    if not candidates:
+        raise ConversionError(
+            "Ego trajectory is too short for {:.1f}s history and {:.1f}s future."
+            .format(history_seconds, future_seconds)
+        )
+    target = float(preferred_frame) if preferred_frame is not None else 0.5 * (lower + upper)
+    return min(candidates, key=lambda frame: abs(frame - target))
+
+
+def native_lane_change_anchor(
+    ego_records: Sequence[Mapping[str, object]],
+    fields: Mapping[str, object],
+    schema: str,
+    fps: float,
+) -> Tuple[Optional[int], Optional[str]]:
+    """Return a pre-maneuver anchor for highD's measured lane-change clips."""
+
+    if schema != "highd" or not any(bool(record.get("lane_diff")) for record in ego_records):
+        return None, None
+    frame_field = str(fields["frame"])
+    behaviour_fields = fields["behaviour"]
+    left_name = str(behaviour_fields[2])
+    right_name = str(behaviour_fields[3])
+    for record in ego_records:
+        left = bool(record.get(left_name))
+        right = bool(record.get(right_name))
+        if left == right:
+            continue
+        maneuver_frame = int(finite_number(record.get(frame_field)))
+        anchor = maneuver_frame - int(round(0.25 * fps))
+        direction = (
+            ACTION_NAMES[DrivingAction.CHANGE_LEFT]
+            if left
+            else ACTION_NAMES[DrivingAction.CHANGE_RIGHT]
+        )
+        return anchor, direction
+    return None, None
+
+
+def future_motion(
+    ego_records: Sequence[Mapping[str, object]],
+    fields: Mapping[str, object],
+    anchor_frame: int,
+    fps: float,
+    future_seconds: float,
+) -> Tuple[float, float]:
+    """Measure actual ego speed/lateral change after an observation frame."""
+
+    frame_field = str(fields["frame"])
+    target_frame = anchor_frame + int(round(future_seconds * fps))
+    window = [
+        record
+        for record in ego_records
+        if anchor_frame
+        <= int(finite_number(record.get(frame_field)))
+        <= target_frame
+    ]
+    if len(window) < 2:
+        raise ConversionError("Insufficient future ego motion for a policy label.")
+    window.sort(key=lambda record: finite_number(record.get(frame_field)))
+
+    initial_speed = actor_speed(window[0], fields)
+    final_speed = actor_speed(window[-1], fields)
+    if not math.isfinite(initial_speed) or not math.isfinite(final_speed):
+        raise ConversionError("Future ego motion has no finite speed.")
+
+    lateral_displacement = 0.0
+    x_field = str(fields["x"])
+    y_field = str(fields["y"])
+    for previous, current in zip(window, window[1:]):
+        previous_x = finite_number(previous.get(x_field))
+        previous_y = finite_number(previous.get(y_field))
+        current_x = finite_number(current.get(x_field))
+        current_y = finite_number(current.get(y_field))
+        heading = heading_radians(previous, fields)
+        if not all(
+            math.isfinite(value)
+            for value in (previous_x, previous_y, current_x, current_y, heading)
+        ):
+            continue
+        delta_x = current_x - previous_x
+        delta_y = current_y - previous_y
+        # Unit vector to the driver's left in the ego heading frame.
+        lateral_displacement += -math.sin(heading) * delta_x + math.cos(heading) * delta_y
+
+    return final_speed - initial_speed, lateral_displacement
+
+
 def convert_event(
-    candidate: Mapping[str, object], history_seconds: float
+    candidate: Mapping[str, object],
+    history_seconds: float,
+    future_seconds: float = 1.0,
 ) -> Tuple[Dict[str, object], Dict[str, object]]:
     path = candidate["path"]
     if not isinstance(path, Path):
@@ -930,41 +1050,75 @@ def convert_event(
     if not ego_records:
         raise ConversionError("Ego ID {0} is absent from event.".format(ego_id))
 
-    peak_frame = choose_peak_frame(
-        ego_records, fields, str(candidate["severity"])
+    fps = SOURCE_FPS[source.lower()]
+    anchor_frame = choose_observation_frame(
+        ego_records,
+        fields,
+        fps,
+        history_seconds,
+        future_seconds,
     )
     states = build_states(
         records,
         ego_id,
         schema,
         source,
-        peak_frame,
+        anchor_frame,
         history_seconds,
+        future_seconds,
     )
 
     if not states:
-        raise ConversionError("No ego states exist at or before peak risk.")
+        raise ConversionError("No ego states exist around the observation frame.")
 
-    feature_values = summarize_history(states)
+    anchor_timestamp = anchor_frame / fps
+    history_states = [state for state in states if state["timestamp"] <= anchor_timestamp + 1e-9]
+    future_states = [state for state in states if state["timestamp"] >= anchor_timestamp - 1e-9]
+    if len(history_states) < 2 or len(future_states) < 2:
+        raise ConversionError("Observation does not contain both history and future states.")
+
+    feature_values = summarize_history(history_states)
+    speed_change, lateral_displacement = future_motion(
+        ego_records,
+        fields,
+        anchor_frame,
+        fps,
+        future_seconds,
+    )
     metadata = {
         "source": "krisk",
+        "domain": source.lower(),
         "group_id": path.stem,
-        "timestamp": float(states[-1]["timestamp"]),
+        "timestamp": float(anchor_timestamp),
+        "label_origin": "observed_future",
+        "history_seconds": float(history_seconds),
+        "future_seconds": float(future_seconds),
+        "sampling_hz": 2.0,
     }
-    lane_change = detect_lane_change(ego_records, fields, peak_frame, schema)
+    # Dataset-native flags are retained only as an audit comparison. They do
+    # not select the observation time and never become the v2 policy target.
+    native_lane_change = detect_lane_change(ego_records, fields, anchor_frame, schema)
+    policy_target = policy_label_from_future_motion(
+        speed_change,
+        lateral_displacement,
+    )
     audit = {
-        "underlying_source": str(candidate["source"]),
-        "history_frames": len(states),
+        "underlying_source": source.lower(),
+        "history_frames": len(history_states),
         "history_duration_seconds": float(
-            states[-1]["timestamp"] - states[0]["timestamp"]
+            history_states[-1]["timestamp"] - history_states[0]["timestamp"]
         ),
-        "peak_frame": peak_frame,
-        "lane_change": lane_change,
+        "future_frames": len(future_states),
+        "anchor_frame": anchor_frame,
+        "policy_target": policy_target,
+        "native_lane_change": native_lane_change,
+        "speed_change_mps": speed_change,
+        "lateral_displacement_metres": lateral_displacement,
     }
 
     row: Dict[str, object] = dict(metadata)
     row.update(feature_values)
-    row["target"] = str(candidate["severity"])
+    row["target"] = risk_label_from_future(future_states)
     return row, audit
 
 
@@ -1008,7 +1162,17 @@ def validate_output(
     policy_data: pd.DataFrame,
     feature_columns: Sequence[str],
 ) -> Dict[str, object]:
-    expected_columns = {"source", "group_id", "timestamp", "target"}.union(
+    expected_columns = {
+        "source",
+        "domain",
+        "group_id",
+        "timestamp",
+        "target",
+        "label_origin",
+        "history_seconds",
+        "future_seconds",
+        "sampling_hz",
+    }.union(
         feature_columns
     )
 
@@ -1035,7 +1199,9 @@ def validate_output(
     if policy_data["group_id"].duplicated().any():
         raise ConversionError("Policy output contains duplicate group IDs.")
 
-    if not set(risk_data["target"]).issubset({"MODERATE", "HIGH", "EXTREME"}):
+    if not set(risk_data["target"]).issubset(
+        {"LOW", "MODERATE", "HIGH", "EXTREME"}
+    ):
         raise ConversionError("Risk output contains an unexpected target.")
     if not set(policy_data["target"]).issubset(
         {"KEEP", "ACCELERATE", "DECELERATE", "CHANGE_LEFT", "CHANGE_RIGHT"}
@@ -1078,6 +1244,8 @@ def run_conversion(arguments: argparse.Namespace) -> Dict[str, object]:
 
     if arguments.history_seconds <= 0.0:
         raise ValueError("--history-seconds must be positive.")
+    if arguments.future_seconds <= 0.0:
+        raise ValueError("--future-seconds must be positive.")
 
     candidates, discovery = discover_events(data_root)
     gpt_actions, gpt_errors = load_gpt_actions(
@@ -1091,9 +1259,12 @@ def run_conversion(arguments: argparse.Namespace) -> Dict[str, object]:
 
     risk_rows: List[Dict[str, object]] = []
     policy_rows: List[Dict[str, object]] = []
+    recommended_policy_rows: List[Dict[str, object]] = []
     native_lane_change_rows = 0
+    native_lane_change_agreements = 0
     gpt_policy_rows_matched = 0
     errors: List[str] = list(gpt_errors)
+    coverage_exclusions: List[str] = []
     source_counts = Counter()
     severity_counts = Counter()
     history_frames: List[int] = []
@@ -1102,19 +1273,26 @@ def run_conversion(arguments: argparse.Namespace) -> Dict[str, object]:
     total = len(candidates)
     for index, candidate in enumerate(candidates, start=1):
         try:
-            risk_row, audit = convert_event(candidate, arguments.history_seconds)
+            risk_row, audit = convert_event(
+                candidate,
+                arguments.history_seconds,
+                arguments.future_seconds,
+            )
             risk_rows.append(risk_row)
             source_counts[str(audit["underlying_source"])] += 1
             severity_counts[str(candidate["severity"])] += 1
             history_frames.append(int(audit["history_frames"]))
             history_durations.append(float(audit["history_duration_seconds"]))
 
-            lane_change = audit.get("lane_change")
-            if lane_change is not None:
-                lane_row = dict(risk_row)
-                lane_row["target"] = lane_change
-                policy_rows.append(lane_row)
+            policy_row = dict(risk_row)
+            policy_row["target"] = str(audit["policy_target"])
+            policy_rows.append(policy_row)
+
+            native_lane_change = audit.get("native_lane_change")
+            if native_lane_change is not None:
                 native_lane_change_rows += 1
+                if native_lane_change == audit["policy_target"]:
+                    native_lane_change_agreements += 1
 
             action_id = gpt_actions.get(str(candidate["stem"]))
             if action_id is not None:
@@ -1126,10 +1304,22 @@ def run_conversion(arguments: argparse.Namespace) -> Dict[str, object]:
                         )
                     )
                 else:
-                    policy_row = dict(risk_row)
-                    policy_row["target"] = ACTION_NAMES[action]
-                    policy_rows.append(policy_row)
+                    recommended_row = dict(risk_row)
+                    recommended_row["target"] = ACTION_NAMES[action]
+                    recommended_row["label_origin"] = "recommended_gpt"
+                    recommended_policy_rows.append(recommended_row)
                     gpt_policy_rows_matched += 1
+        except ConversionError as error:
+            message = str(error)
+            if (
+                "trajectory is too short" in message
+                or "does not contain both history and future" in message
+            ):
+                coverage_exclusions.append(
+                    "{0}: {1}".format(candidate["path"], message)
+                )
+            else:
+                errors.append("{0}: {1}".format(candidate["path"], message))
         except Exception as error:  # Continue so one corrupt event is reportable.
             errors.append("{0}: {1}".format(candidate["path"], error))
 
@@ -1137,8 +1327,8 @@ def run_conversion(arguments: argparse.Namespace) -> Dict[str, object]:
             index % arguments.progress_every == 0 or index == total
         ):
             print(
-                "Processed {0:,}/{1:,} events ({2:,} errors)".format(
-                    index, total, len(errors)
+                "Processed {0:,}/{1:,} events ({2:,} errors, {3:,} coverage exclusions)".format(
+                    index, total, len(errors), len(coverage_exclusions)
                 ),
                 flush=True,
             )
@@ -1146,13 +1336,22 @@ def run_conversion(arguments: argparse.Namespace) -> Dict[str, object]:
     feature_columns = expected_feature_columns()
     ordered_columns = [
         "source",
+        "domain",
         "group_id",
         "timestamp",
         "target",
+        "label_origin",
+        "history_seconds",
+        "future_seconds",
+        "sampling_hz",
     ] + feature_columns
 
     risk_data = pd.DataFrame(risk_rows, columns=ordered_columns)
     policy_data = pd.DataFrame(policy_rows, columns=ordered_columns)
+    recommended_policy_data = pd.DataFrame(
+        recommended_policy_rows,
+        columns=ordered_columns,
+    )
 
     validation = validate_output(risk_data, policy_data, feature_columns)
 
@@ -1161,15 +1360,18 @@ def run_conversion(arguments: argparse.Namespace) -> Dict[str, object]:
 
     risk_path = output_directory / "risk_krisk.parquet"
     policy_path = output_directory / "policy_krisk.parquet"
+    recommended_policy_path = output_directory / "policy_krisk_recommended.parquet"
 
     risk_data.to_parquet(risk_path, index=False)
     policy_data.to_parquet(policy_path, index=False)
+    recommended_policy_data.to_parquet(recommended_policy_path, index=False)
 
     report: Dict[str, object] = {
         "format": "roadweave.krisk-conversion-report/1.0",
         "data_root": str(data_root),
         "output_directory": str(output_directory),
         "history_seconds_requested": arguments.history_seconds,
+        "future_seconds_requested": arguments.future_seconds,
         "smoke_test": bool(arguments.smoke_test),
         "max_events": arguments.max_events,
         "discovery": discovery,
@@ -1179,7 +1381,9 @@ def run_conversion(arguments: argparse.Namespace) -> Dict[str, object]:
         "gpt_responses_found": len(gpt_actions),
         "gpt_responses_matched": gpt_policy_rows_matched,
         "native_lane_change_rows": native_lane_change_rows,
+        "native_lane_change_agreements": native_lane_change_agreements,
         "policy_rows_total": len(policy_rows),
+        "recommended_policy_rows": len(recommended_policy_rows),
         "history": {
             "minimum_frames": min(history_frames) if history_frames else 0,
             "maximum_frames": max(history_frames) if history_frames else 0,
@@ -1197,9 +1401,12 @@ def run_conversion(arguments: argparse.Namespace) -> Dict[str, object]:
         "validation": validation,
         "error_count": len(errors),
         "errors": errors[:100],
+        "coverage_exclusion_count": len(coverage_exclusions),
+        "coverage_exclusions": coverage_exclusions[:100],
         "outputs": {
             "risk": str(risk_path),
             "policy": str(policy_path),
+            "recommended_policy_audit_only": str(recommended_policy_path),
             "report": str(report_path),
         },
     }
@@ -1215,6 +1422,11 @@ def run_conversion(arguments: argparse.Namespace) -> Dict[str, object]:
 
     print("Wrote {0:,} risk rows to {1}".format(len(risk_data), risk_path))
     print("Wrote {0:,} policy rows to {1}".format(len(policy_data), policy_path))
+    print(
+        "Wrote {0:,} recommendation-only rows to {1}".format(
+            len(recommended_policy_data), recommended_policy_path
+        )
+    )
     print("Wrote conversion report to {0}".format(report_path))
     return report
 
@@ -1244,8 +1456,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--history-seconds",
         type=float,
-        default=3.0,
-        help="Maximum past/current history ending at peak risk (default: 3).",
+        default=1.0,
+        help="Past/current history before the observation frame (default: 1).",
+    )
+    parser.add_argument(
+        "--future-seconds",
+        type=float,
+        default=1.0,
+        help="Measured future used only for physical labels (default: 1).",
     )
     parser.add_argument(
         "--max-events",

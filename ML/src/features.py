@@ -96,8 +96,9 @@ def set_slot(
 
 def summarize_history(
     states: Iterable[Dict[str, float]],
+    sample_rate_hz: float = 2.0,
 ) -> Dict[str, float]:
-    history: List[Dict[str, float]] = list(states)
+    history: List[Dict[str, float]] = resample_history(states, sample_rate_hz)
 
     if not history:
         raise ValueError("Cannot summarize an empty history.")
@@ -137,3 +138,53 @@ def summarize_history(
         )
 
     return result
+
+
+def resample_history(
+    states: Iterable[Dict[str, float]],
+    sample_rate_hz: float = 2.0,
+) -> List[Dict[str, float]]:
+    """Return a source-neutral fixed-rate view ending at the latest state.
+
+    nuScenes keyframes are approximately 2 Hz, while trajectory datasets and
+    RoadWeave runtime observations are much faster.  Summarizing every raw
+    sample makes sampling frequency a dataset fingerprint.  Selecting the
+    latest observation at or before each 2 Hz grid point gives every adapter
+    the same temporal contract without interpolating unavailable detections.
+    """
+
+    history = sorted(list(states), key=lambda state: float(state["timestamp"]))
+    if not history:
+        return []
+    if sample_rate_hz <= 0.0 or len(history) == 1:
+        return history
+
+    interval = 1.0 / sample_rate_hz
+    start = float(history[0]["timestamp"])
+    end = float(history[-1]["timestamp"])
+    if end - start < interval * 0.5:
+        return [history[-1]]
+
+    targets: List[float] = []
+    target = end
+    while target >= start - 1e-9:
+        targets.append(target)
+        target -= interval
+    targets.reverse()
+
+    selected: List[Dict[str, float]] = []
+    source_index = 0
+    latest = history[0]
+    for target in targets:
+        while (
+            source_index + 1 < len(history)
+            and float(history[source_index + 1]["timestamp"]) <= target + 1e-9
+        ):
+            source_index += 1
+            latest = history[source_index]
+        if not selected or latest is not selected[-1]:
+            selected.append(latest)
+
+    if selected[-1] is not history[-1]:
+        selected.append(history[-1])
+    return selected

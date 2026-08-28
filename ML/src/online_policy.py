@@ -18,10 +18,10 @@ import math
 
 try:
     from ML.src.features import new_state, set_slot, summarize_history
-    from ML.src.model_support import load_artifact, predict_one
+    from ML.src.model_support import assess_ood, load_artifact, predict_one
 except ModuleNotFoundError:
     from features import new_state, set_slot, summarize_history  # type: ignore
-    from model_support import load_artifact, predict_one  # type: ignore
+    from model_support import assess_ood, load_artifact, predict_one  # type: ignore
 
 
 @dataclass(frozen=True)
@@ -89,6 +89,7 @@ class RoadWeaveMLController:
         self.risk_level = "LOW"
         self.risk_confidence = 0.0
         self.override_reason = ""
+        self.ood_score = 0.0
         self.last_target_speed = cruise_speed_mps
         self.pending_lane_action: Optional[str] = None
         self.pending_lane_votes = 0
@@ -102,6 +103,7 @@ class RoadWeaveMLController:
             "riskLevel": self.risk_level,
             "riskConfidence": round(self.risk_confidence, 4),
             "overrideReason": self.override_reason,
+            "oodScore": round(self.ood_score, 4),
         }
 
     def decide(
@@ -376,10 +378,21 @@ class RoadWeaveMLController:
                 )
         return updated
 
-    def _predict_summary(self, summary: Mapping[str, float]) -> Tuple[str, float, str, float]:
+    def _predict_summary(
+        self, summary: Mapping[str, float]
+    ) -> Tuple[str, float, str, float, bool, float]:
         risk, risk_confidence, _ = predict_one(self.models.risk, summary)
         action, action_confidence, _ = predict_one(self.models.policy, summary)
-        return risk, risk_confidence, action, action_confidence
+        risk_ood, risk_ood_score, _ = assess_ood(self.models.risk, summary)
+        policy_ood, policy_ood_score, _ = assess_ood(self.models.policy, summary)
+        return (
+            risk,
+            risk_confidence,
+            action,
+            action_confidence,
+            risk_ood or policy_ood,
+            max(risk_ood_score, policy_ood_score),
+        )
 
     def _run_models(self) -> None:
         """Synchronous path retained for unit tests and offline benchmarks."""
@@ -389,16 +402,20 @@ class RoadWeaveMLController:
 
     def _apply_model_output(
         self,
-        prediction: Tuple[str, float, str, float],
+        prediction: Tuple[str, float, str, float, bool, float],
     ) -> None:
-        risk, risk_confidence, action, action_confidence = prediction
+        risk, risk_confidence, action, action_confidence, is_ood, ood_score = prediction
         self.risk_level = risk
         self.risk_confidence = risk_confidence
         self.requested_action = action
         self.action_confidence = action_confidence
         self.override_reason = ""
+        self.ood_score = ood_score
 
-        if action_confidence < self.confidence_threshold:
+        if is_ood:
+            candidate_action = self.DECELERATE
+            self.override_reason = "observation outside training domain"
+        elif action_confidence < self.confidence_threshold:
             candidate_action = self.DECELERATE
             self.override_reason = "policy confidence below {:.2f}".format(
                 self.confidence_threshold

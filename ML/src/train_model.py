@@ -28,24 +28,33 @@ from sklearn.metrics import (
 from sklearn.model_selection import GroupShuffleSplit
 
 try:
+    from ML.src.hierarchical_policy import HierarchicalPolicyClassifier
+except ModuleNotFoundError:
+    from hierarchical_policy import HierarchicalPolicyClassifier  # type: ignore
+
+try:
     from ML.src.model_support import (
         SCHEMA_VERSION,
         TASK_LABELS,
+        build_ood_profile,
         clean_feature_frame,
         expected_data_paths,
         load_task_data,
         ml_root,
         select_feature_columns,
+        select_transfer_feature_columns,
     )
 except ModuleNotFoundError:
     from model_support import (  # type: ignore
         SCHEMA_VERSION,
         TASK_LABELS,
+        build_ood_profile,
         clean_feature_frame,
         expected_data_paths,
         load_task_data,
         ml_root,
         select_feature_columns,
+        select_transfer_feature_columns,
     )
 
 
@@ -147,7 +156,7 @@ def _class_counts(data: pd.DataFrame, labels: Sequence[str]) -> Dict[str, int]:
 
 
 def _evaluate(
-    model: HistGradientBoostingClassifier,
+    model: Any,
     data: pd.DataFrame,
     feature_columns: Sequence[str],
     label_order: Sequence[str],
@@ -185,7 +194,10 @@ def _evaluate(
         log_loss(expected, probabilities, labels=list(model.classes_))
     )
 
-    predictions = data[["source", "group_id", "_split_group", "target"]].copy()
+    prediction_columns = ["source", "domain", "group_id", "_split_group", "target"]
+    predictions = data[[
+        column for column in prediction_columns if column in data.columns
+    ]].copy()
     if "timestamp" in data.columns:
         predictions["timestamp"] = data["timestamp"].to_numpy()
     predictions["prediction"] = predicted
@@ -196,7 +208,7 @@ def _evaluate(
 
 
 def _domain_metrics(
-    model: HistGradientBoostingClassifier,
+    model: Any,
     data: pd.DataFrame,
     feature_columns: Sequence[str],
     label_order: Sequence[str],
@@ -208,13 +220,66 @@ def _domain_metrics(
     return result
 
 
-def leave_one_source_out(
+def balanced_sample_weights(
+    data: pd.DataFrame,
+    balance_field: str = "source",
+) -> np.ndarray:
+    """Give every available domain/class cell equal total training influence."""
+
+    if balance_field not in data.columns:
+        return np.ones(len(data), dtype=np.float64)
+    keys = list(zip(data[balance_field].astype(str), data["target"].astype(str)))
+    counts: Dict[Tuple[str, str], int] = {}
+    for key in keys:
+        counts[key] = counts.get(key, 0) + 1
+    cell_count = max(1, len(counts))
+    weights = np.asarray(
+        [len(data) / (cell_count * counts[key]) for key in keys],
+        dtype=np.float64,
+    )
+    weights = np.clip(weights, 0.10, 10.0)
+    return weights / max(1e-9, float(np.mean(weights)))
+
+
+def make_model(
+    task: str,
+    seed: int,
+    max_iter: int,
+    learning_rate: float = 0.05,
+    max_leaf_nodes: int = 31,
+    min_samples_leaf: int = 20,
+    policy_architecture: str = "flat",
+) -> Any:
+    if task == "policy" and policy_architecture == "hierarchical":
+        return HierarchicalPolicyClassifier(
+            learning_rate=learning_rate,
+            max_iter=max_iter,
+            max_leaf_nodes=max_leaf_nodes,
+            min_samples_leaf=min_samples_leaf,
+            l2_regularization=1.0,
+            random_state=seed,
+        )
+    return HistGradientBoostingClassifier(
+        learning_rate=learning_rate,
+        max_iter=max_iter,
+        max_leaf_nodes=max_leaf_nodes,
+        min_samples_leaf=min_samples_leaf,
+        l2_regularization=1.0,
+        class_weight=None,
+        early_stopping=False,
+        random_state=seed,
+    )
+
+
+def leave_one_value_out(
     data: pd.DataFrame,
     feature_columns: Sequence[str],
     labels: Sequence[str],
-    task: str,
     seed: int,
-    krisk_policy_weight: float,
+    field: str,
+    task: str,
+    max_iter: int = 100,
+    policy_architecture: str = "flat",
 ) -> Dict[str, Any]:
     """Train on every source except one, then evaluate on the held-out source.
 
@@ -224,41 +289,76 @@ def leave_one_source_out(
     """
 
     results: Dict[str, Any] = {}
-    sources = sorted(data["source"].astype(str).unique())
-    for held_out_source in sources:
-        train = data[data["source"].astype(str) != held_out_source]
-        test = data[data["source"].astype(str) == held_out_source]
+    values = sorted(data[field].astype(str).unique())
+    for held_out_value in values:
+        train = data[data[field].astype(str) != held_out_value]
+        test = data[data[field].astype(str) == held_out_value]
         if train.empty or test.empty:
             continue
 
-        model = HistGradientBoostingClassifier(
-            learning_rate=0.05,
-            max_iter=350,
-            max_leaf_nodes=31,
-            min_samples_leaf=20,
-            l2_regularization=1.0,
-            class_weight="balanced",
-            early_stopping=False,
-            random_state=seed,
+        model = make_model(
+            task,
+            seed,
+            max_iter,
+            max_leaf_nodes=23,
+            min_samples_leaf=30,
+            policy_architecture=policy_architecture,
         )
         x_train = clean_feature_frame(train, feature_columns)
         y_train = train["target"].astype(str)
-        sample_weight = np.ones(len(train), dtype=np.float64)
-        if task == "policy":
-            krisk_rows = train["source"].astype(str).eq("krisk").to_numpy()
-            sample_weight[krisk_rows] = max(1.0, krisk_policy_weight)
+        sample_weight = balanced_sample_weights(train, "source")
         model.fit(x_train, y_train, sample_weight=sample_weight)
 
         metrics, _ = _evaluate(model, test, feature_columns, labels)
-        results[str(held_out_source)] = {
-            "trained_on": [s for s in sources if s != held_out_source],
+        result = {
+            "trained_on": [value for value in values if value != held_out_value],
             "rows": metrics["rows"],
             "accuracy": metrics["accuracy"],
             "balanced_accuracy": metrics["balanced_accuracy"],
             "macro_f1": metrics["macro_f1"],
             "weighted_f1": metrics["weighted_f1"],
         }
+        if "pedestrian_present_max" in test.columns:
+            overlap = test[
+                pd.to_numeric(test["pedestrian_present_max"], errors="coerce")
+                .fillna(0.0)
+                .lt(0.5)
+            ]
+            if not overlap.empty:
+                overlap_metrics, _ = _evaluate(model, overlap, feature_columns, labels)
+                result["vehicle_overlap_subset"] = {
+                    "definition": "no pedestrian observed in the input history",
+                    "rows": overlap_metrics["rows"],
+                    "accuracy": overlap_metrics["accuracy"],
+                    "macro_f1": overlap_metrics["macro_f1"],
+                    "weighted_f1": overlap_metrics["weighted_f1"],
+                }
+        results[str(held_out_value)] = result
     return results
+
+
+def leave_one_source_out(
+    data: pd.DataFrame,
+    feature_columns: Sequence[str],
+    labels: Sequence[str],
+    task: str,
+    seed: int,
+    krisk_policy_weight: float,
+    policy_architecture: str = "flat",
+) -> Dict[str, Any]:
+    # Keep the public function for older scripts; the legacy task-specific GPT
+    # weighting is intentionally ignored by the shared-label v2 pipeline.
+    del krisk_policy_weight
+    return leave_one_value_out(
+        data,
+        feature_columns,
+        labels,
+        seed,
+        "source",
+        task,
+        120,
+        policy_architecture,
+    )
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -278,6 +378,30 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--max-leaf-nodes", type=int, default=31)
     parser.add_argument("--min-samples-leaf", type=int, default=20)
     parser.add_argument("--krisk-policy-weight", type=float, default=3.0)
+    parser.add_argument(
+        "--feature-profile",
+        choices=("transfer", "all"),
+        default="transfer",
+        help="Use the source-overlap transfer profile (default) or every numeric feature.",
+    )
+    parser.add_argument(
+        "--policy-architecture",
+        choices=("flat", "hierarchical"),
+        default="flat",
+        help="Five-way flat classifier (default) or experimental two-stage policy.",
+    )
+    parser.add_argument(
+        "--holdout-max-iter",
+        type=int,
+        default=100,
+        help="Iterations for each source/domain holdout diagnostic model.",
+    )
+    parser.add_argument(
+        "--balance-by",
+        choices=("source", "domain"),
+        default="source",
+        help="Equalize total weight for each available domain/class cell.",
+    )
     parser.add_argument(
         "--importance-jobs",
         type=int,
@@ -316,7 +440,10 @@ def main() -> int:
     labels = TASK_LABELS[task]
     input_paths = arguments.data or expected_data_paths(task)
     data = load_task_data(task, input_paths)
-    feature_columns, rejected_columns = select_feature_columns(data)
+    if arguments.feature_profile == "transfer":
+        feature_columns, rejected_columns = select_transfer_feature_columns(data)
+    else:
+        feature_columns, rejected_columns = select_feature_columns(data)
 
     train, validation, test = make_splits(data, seed=arguments.seed)
     print("Task: {}".format(task))
@@ -336,20 +463,16 @@ def main() -> int:
 
     x_train = clean_feature_frame(train, feature_columns)
     y_train = train["target"].astype(str)
-    sample_weight = np.ones(len(train), dtype=np.float64)
-    if task == "policy":
-        krisk_rows = train["source"].astype(str).eq("krisk").to_numpy()
-        sample_weight[krisk_rows] = max(1.0, arguments.krisk_policy_weight)
+    sample_weight = balanced_sample_weights(train, arguments.balance_by)
 
-    model = HistGradientBoostingClassifier(
-        learning_rate=arguments.learning_rate,
-        max_iter=arguments.max_iter,
-        max_leaf_nodes=arguments.max_leaf_nodes,
-        min_samples_leaf=arguments.min_samples_leaf,
-        l2_regularization=1.0,
-        class_weight="balanced",
-        early_stopping=False,
-        random_state=arguments.seed,
+    model = make_model(
+        task,
+        arguments.seed,
+        arguments.max_iter,
+        arguments.learning_rate,
+        arguments.max_leaf_nodes,
+        arguments.min_samples_leaf,
+        arguments.policy_architecture,
     )
     model.fit(x_train, y_train, sample_weight=sample_weight)
 
@@ -367,6 +490,17 @@ def main() -> int:
         task,
         arguments.seed,
         arguments.krisk_policy_weight,
+        arguments.policy_architecture,
+    )
+    leave_one_domain = leave_one_value_out(
+        data,
+        feature_columns,
+        labels,
+        arguments.seed,
+        "domain",
+        task,
+        arguments.holdout_max_iter,
+        arguments.policy_architecture,
     )
 
     importance_sample_size = max(1, arguments.importance_sample_size)
@@ -405,7 +539,7 @@ def main() -> int:
     now = datetime.now(timezone.utc).isoformat()
     artifact: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
-        "model_version": "{}-baseline-1.0".format(task),
+        "model_version": "{}-shared-physical-2.0".format(task),
         "task": task,
         "created_utc": now,
         "python_version": platform.python_version(),
@@ -413,12 +547,16 @@ def main() -> int:
         "feature_columns": feature_columns,
         "label_order": list(labels),
         "model": model,
+        "ood_profile": build_ood_profile(train, feature_columns),
         "training": {
             "seed": arguments.seed,
             "input_paths": [str(Path(path).expanduser().resolve()) for path in input_paths],
             "train_rows": len(train),
             "validation_rows": len(validation),
             "test_rows": len(test),
+            "balance_by": arguments.balance_by,
+            "feature_profile": arguments.feature_profile,
+            "policy_architecture": arguments.policy_architecture,
         },
     }
 
@@ -452,6 +590,7 @@ def main() -> int:
         "groups": int(data["_split_group"].nunique()),
         "feature_count": len(feature_columns),
         "feature_columns": feature_columns,
+        "feature_profile": arguments.feature_profile,
         "rejected_non_numeric_or_empty_columns": rejected_columns,
         "class_counts": {
             "all": _class_counts(data, labels),
@@ -465,6 +604,7 @@ def main() -> int:
             model, test, feature_columns, labels
         ),
         "leave_one_source_out": leave_one_out,
+        "leave_one_domain_out": leave_one_domain,
         "important_features": important_features,
         "model_path": str(model_path),
         "predictions_path": str(predictions_path),

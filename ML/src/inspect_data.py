@@ -21,6 +21,7 @@ import pandas as pd
 try:
     from ML.src.model_support import (
         FORBIDDEN_FEATURE_NAMES,
+        METADATA_COLUMNS,
         TASK_FILES,
         TASK_LABELS,
         expected_data_paths,
@@ -30,6 +31,7 @@ try:
 except ModuleNotFoundError:
     from model_support import (  # type: ignore
         FORBIDDEN_FEATURE_NAMES,
+        METADATA_COLUMNS,
         TASK_FILES,
         TASK_LABELS,
         expected_data_paths,
@@ -148,9 +150,8 @@ def inspect_file(path: Path, task: str) -> Dict[str, Any]:
         }
         absent = [label for label, count in report["target_counts"].items() if count == 0]
         if absent:
-            # Each source is intentionally partial: nuScenes supplies routine
-            # LOW-risk driving and K-Risk supplies the hazardous classes.
-            # Completeness is therefore checked across all files for a task.
+            # A single physical source may legitimately omit a rare class;
+            # completeness is checked across all files for the task.
             report["warnings"].append(
                 "This source has no examples for target class(es): {}".format(
                     ", ".join(absent)
@@ -181,6 +182,8 @@ def inspect_file(path: Path, task: str) -> Dict[str, Any]:
     suspicious = []
     for column in data.columns:
         lower = column.lower()
+        if column in METADATA_COLUMNS:
+            continue
         if (
             lower in FORBIDDEN_FEATURE_NAMES
             or lower.startswith("future_")

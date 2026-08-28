@@ -5,66 +5,61 @@
 This is a research prototype and demonstration baseline, not a controller for
 a physical vehicle. The deterministic collision supervisor must remain active.
 
-Training completed on 2026-08-25 with Python 3.9.6 and scikit-learn 1.6.1. All
+Shared-label v2 training completed on 2026-08-28 with Python 3.9.6 and
+scikit-learn 1.6.1. All
 splits are group-disjoint: rows from the same nuScenes scene or K-Risk event
 cannot appear on both sides of a train/validation/test boundary.
 
 ## Risk model
 
 - Model: histogram gradient-boosting classifier
-- Rows: 41,668
-- Independent groups: 26,901
-- Classes: LOW 7,746; MODERATE 21,774; HIGH 8,627; EXTREME 3,521
-- Test accuracy: 0.9181
-- Test macro-F1: 0.9083
-- Leave-one-source-out macro-F1: 0.0758 (train nuScenes → test K-Risk),
-  0.0746 (train K-Risk → test nuScenes)
+- Rows: 39,918 (15,908 nuScenes; 24,010 K-Risk)
+- Independent groups: 24,844
+- Test accuracy: 0.8423
+- Test macro-F1: 0.7580
+- Per-class test F1: LOW 0.923; MODERATE 0.639; HIGH 0.703; EXTREME 0.767
+- Leave-one-source-out macro-F1: 0.5011 (train nuScenes → K-Risk),
+  0.2882 (train K-Risk → nuScenes)
+- Vehicle-overlap subset for K-Risk → nuScenes: 0.4411 macro-F1 (7,575 rows)
 
-nuScenes risk is now graded into all four levels from physical severity (ego
-acceleration, front TTC, pedestrian gap, and overlap) instead of only LOW, and
-the K-Risk conversion now includes inD and rounD alongside highD and CitySim.
-This removes the "LOW always means nuScenes" shortcut for the within-domain
-task: random group-separated macro-F1 rose from 0.82 to 0.91.
-
-The leave-one-source-out numbers are the honest measure of generalization:
-they stay near 0.08 because the two datasets are genuinely different domains
-(urban sensor-rich driving vs. German/Chinese trajectory segments). The model
-still cannot transfer across that gap, so treat every within-domain score as
-optimistic evidence.
+Both adapters now call the same future physical label function. The target is
+the measured next-second outcome using current-path TTC, required
+deceleration, acceleration, pedestrian clearance, and overlap. The input is
+only the previous/current second. Compared with the old 0.0758/0.0746 transfer
+scores, this is a large improvement, but the asymmetric K-Risk → nuScenes
+result still reflects pedestrians and urban interactions absent from K-Risk.
+It is not evidence of real-vehicle generalization.
 
 ## Policy model
 
 - Model: histogram gradient-boosting classifier
-- Rows: 13,426
-- Classes: KEEP 11,889; ACCELERATE 658; DECELERATE 632; CHANGE_LEFT 136;
-  CHANGE_RIGHT 111
-- Test accuracy: 0.9206
-- Test macro-F1: 0.7612
-- Per-class test F1: KEEP 0.957; ACCELERATE 0.566; DECELERATE 0.531;
-  CHANGE_LEFT 0.906; CHANGE_RIGHT 0.846
-- Leave-one-source-out macro-F1: 0.1426 (train nuScenes → test K-Risk),
-  0.2023 (train K-Risk → test nuScenes)
+- Model: flat five-way histogram gradient-boosting classifier
+- Rows: 39,918
+- Test accuracy: 0.7965
+- Test macro-F1: 0.5609
+- Per-class test F1: KEEP 0.880; ACCELERATE 0.686; DECELERATE 0.635;
+  CHANGE_LEFT 0.267; CHANGE_RIGHT 0.336
+- Leave-one-source-out macro-F1: 0.3766 (train nuScenes → K-Risk),
+  0.4876 (train K-Risk → nuScenes)
+- Vehicle-overlap subset for K-Risk → nuScenes: 0.5063 macro-F1
 
-Lane changes are now learnable. highD contributes direction only when its
-native `yaw_left`/`yaw_right` signal is paired with a true clip-level
-`lane_diff`; nuScenes lane changes are detected by integrating lateral motion
-per frame heading (curvature-invariant) over a 3 s window. This avoids treating
-21 notable lateral movements as completed lane changes while preserving strong
-held-out lane-change scores.
-
-The policy score is still within-domain evidence. Its leave-one-source-out
-results remain weak, so it must not be described as a source-independent or
-real-vehicle-ready controller.
+Every core K-Risk row is now labelled from actual next-second ego motion. The
+372 GPT-4.1 recommended actions remain in a separate audit-only Parquet file
+and are never fitted. This makes the task harder and explains why the ordinary
+macro-F1 is below the former 0.7612, but transfer is substantially more honest
+and improves from the former 0.1426/0.2023. A two-stage lateral/longitudinal
+classifier was also evaluated; it fell to 0.5244 ordinary and about 0.36 in
+both source holdouts, so the flat model was retained.
 
 ## Controller benchmark
 
-The original six-seed, 150-second benchmark found the ML controller more
-conservative than the deterministic controller. After the lane-label cleanup,
-a two-seed, 90-second regression run confirmed the same direction: rule/ML
-progress was 716/641 m, minimum TTC 1.352/1.394 s, emergency stops 2/2,
-deadlock time 1.85/3.55 s, and mean absolute acceleration 1.027/1.089 m/s².
-This shorter post-clean run is a regression check, not a replacement for a
-larger statistical evaluation.
+The selected v2 pair was evaluated on six unseen procedural seeds for 120
+seconds each. Rule/ML mean progress was 861.14/940.53 m; minimum clearance was
+-3.47/1.14 m; minimum TTC was 0.009/0.493 s; deadlock time was 2.92/1.20 s;
+mean absolute acceleration was 1.216/1.099 m/s²; and mean absolute yaw was
+2.228/2.185 degrees/s. The ML controller therefore improved this closed-loop
+benchmark, although six procedural seeds are still a prototype-scale study and
+not a safety certification.
 
 ## Weather-speed model
 
@@ -116,6 +111,8 @@ simulated vehicle:
 - rejection of a lane change when its front or rear clearance is unsafe;
 - three consecutive model votes before accepting a lane change;
 - conservative deceleration for low-confidence, high-risk, or extreme-risk requests;
+- artifact-specific OOD envelopes that request cautious deceleration when too
+  many physical features fall outside the training distribution;
 - continued 30 Hz safety/physics updates around the 5 Hz learned decisions.
 
 ## Virtual-sensor reliability models
@@ -148,15 +145,16 @@ controlled real fault injection, calibration checks, and external validation.
 
 ## Required next research work
 
-1. Improve cross-domain generalization and calibration; the risk model's ~0.08
-   and policy model's ~0.14–0.20 leave-one-source-out scores show that labeling
-   alone does not close the domain gap.
+1. Continue cross-domain calibration. Shared physical labels raised source
+   holdouts substantially, but risk remains asymmetric (0.501/0.288) and policy
+   remains moderate (0.377/0.488). A source classifier still identifies the
+   dataset at about 0.99 macro-F1, proving residual covariate shift.
 2. Add an NGSIM adapter with an explicit feet→metres unit conversion. Its
    K-Risk release retains native feet despite the `info.txt` labelling them as
    metres, so it needs a separately verified unit test before use.
-3. Compare this baseline against the deterministic controller (see
-   `Tools/benchmark_controllers.py`) on minimum TTC, clearance, intervention
-   count, deadlock time, route progress, and comfort.
-4. Keep the ML controller in Test Lab/simulation until those checks are complete.
+3. Expand the six-seed closed-loop benchmark with more routes, confidence
+   intervals, ablations, and unseen scenario families.
+4. Keep the ML controller in Test Lab/simulation until hardware-domain OOD,
+   calibration, and controlled fault tests are complete.
 5. Validate the reliability feature distributions against a real sensor gateway
    and retrain/calibrate the three regressors before using hardware scores.

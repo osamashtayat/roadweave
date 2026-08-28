@@ -18,8 +18,8 @@ snapshot.
 
 ```text
 nuScenes + CAN ----------------> build_nuscenes.py ---+
-                                                       +--> canonical 3 s feature tables
-selected K-Risk trajectories --> build_krisk.py ------+             |
+                                                       +--> canonical 1 s / 2 Hz tables
+K-Risk trajectories ----------> build_krisk.py ------+             |
                                                                     v
                                                    risk_model + policy_model
                                                                     |
@@ -45,11 +45,12 @@ Unity actor truth --> virtual camera/LiDAR/radar --> fused observation
                 camera/LiDAR/radar reliability models --> safety mode
 ```
 
-Each training row has source/group metadata, one target, and 210 canonical
-features. The features are six summaries (`now`, `min`, `max`, `mean`, `std`,
-and `trend`) of 35 physical signals over up to three seconds. No raw risk
-score, folder name, future pose, GPT response, or action label is admitted as
-a feature.
+Each training row has dataset, underlying-domain, group, timing, and label
+origin metadata plus canonical physical summaries. Both adapters use exactly
+one measured second of past/current state, resampled to 2 Hz. Measurements in
+the following second create the risk and actual-motion targets but never enter
+the feature matrix. No raw risk score, folder name, future pose, GPT response,
+or dataset-native action label is admitted as a feature.
 
 ## Current labels
 
@@ -61,12 +62,13 @@ a feature.
 - Yaw rate: degrees/second
 - TTC: seconds, capped at 20
 
-nuScenes supplies conservatively selected `LOW` risk windows and routine
-policy examples. K-Risk supplies `MODERATE`, `HIGH`, and `EXTREME` risk events.
-The K-Risk policy subset uses the 372 available GPT-4.1 recommended-action
-labels plus 203 highD lane changes whose direction is supplied by the native
-`yaw_left`/`yaw_right` signals and whose completion is confirmed by
-`lane_diff`. It does not learn to imitate an unconfirmed lateral swerve.
+`common_labels.py` assigns both datasets with the same physical rules. Risk is
+derived from future TTC, required deceleration, ego acceleration, pedestrian
+clearance, and overlap. Policy is the ego's measured future speed and
+curvature-normalized lateral motion. The 372 GPT-4.1 recommendations are now
+written only to `policy_krisk_recommended.parquet` for audit; the deployable
+policy model never trains on them. This corrects the old mismatch where
+nuScenes meant “what the driver did” but K-Risk meant “what GPT recommends.”
 
 The K-Risk converter supports highD, CitySim ExpresswayA/FreewayB (including
 the extreme TTC folders), inD, and rounD. NGSIM is deliberately not mixed in:
@@ -80,12 +82,14 @@ Run these commands from `/Users/asus/Desktop/roadweave`:
 ```bash
 source ML/.venv/bin/activate
 
-python ML/src/build_krisk.py --fail-on-error
+python ML/src/build_krisk.py
 python ML/src/build_nuscenes.py --overwrite --validate
 python ML/src/inspect_data.py
 
-python ML/src/train_model.py --task risk
-python ML/src/train_model.py --task policy
+python ML/src/train_model.py --task risk --feature-profile all
+python ML/src/train_model.py --task policy --feature-profile transfer
+python ML/src/audit_domains.py --task risk
+python ML/src/audit_domains.py --task policy
 
 python ML/src/build_extreme_weather.py
 python ML/src/train_weather_model.py
@@ -99,6 +103,7 @@ python ML/src/test_prediction.py --task policy
 python -m unittest discover -s ML -p 'test*.py' -v
 python Tools/simulated_twin_stream.py --self-test
 python Tools/simulated_twin_stream.py --controller ml --self-test
+python Tools/benchmark_controllers.py --seeds 6 --seconds 120
 ```
 
 The converters default to the dataset locations used on this Mac:
@@ -128,9 +133,12 @@ rule controller again, omit `--controller ml` (rule mode remains the default).
 
 The ML policy makes a high-level decision at 5 Hz while the world, sensors,
 collision supervisor, and outgoing stream continue at 30 Hz. A reset creates a
-new controller and clears its three-second history. Emergency pedestrian/front
+new controller and clears its one-second history. Emergency pedestrian/front
 object braking, lane-clearance rejection, and three-vote lane-change
-confirmation remain deterministic safety constraints.
+confirmation remain deterministic safety constraints. Each model artifact also
+contains a learned feature envelope. A substantially out-of-distribution
+observation requests cautious deceleration and exposes its OOD score in the
+runtime diagnostics; it never disables the deterministic supervisor.
 
 ## Run the ML models in the Test Lab
 
@@ -207,19 +215,24 @@ Prepared data, saved models, and reports are generated locally under:
 - `ML/reports/`
 
 They are ignored by Git because they are reproducible artifacts. The completed
-run produced 41,668 risk rows and 13,426 policy rows after the nuScenes and
-K-Risk tables were combined. See `MODEL_CARD.md` for the measured performance
+shared-label run produced 39,918 rows for each task: 15,908 nuScenes windows
+and 24,010 K-Risk events. See `MODEL_CARD.md` for the measured within-domain,
+leave-one-source-out, leave-one-domain-out, and closed-loop performance
 and the limitations that matter before presenting or publishing this baseline.
 
 ## File guide
 
 - `src/features.py`: canonical current/history feature contract
 - `src/labels.py`: stable numeric and named target definitions
+- `src/common_labels.py`: identical future physical targets for every adapter
 - `src/build_krisk.py`: K-Risk discovery, conversion, validation, and report
 - `src/build_nuscenes.py`: nuScenes/CAN conversion and future-only policy labels
+- `src/nuscenes_lite.py`: read-only metadata/CAN loader without plotting dependencies
 - `src/inspect_data.py`: read-only pre-training quality gate
-- `src/model_support.py`: shared loading, schema validation, and prediction code
-- `src/train_model.py`: group-separated fitting, evaluation, artifacts, and reports
+- `src/model_support.py`: schema, transfer profile, OOD envelope, and prediction code
+- `src/train_model.py`: balanced fitting plus group/source/domain holdout evaluation
+- `src/audit_domains.py`: source classifier and per-feature distribution-drift audit
+- `src/hierarchical_policy.py`: reproducible rejected two-stage policy experiment
 - `src/test_prediction.py`: explains one saved-model prediction
 - `src/online_policy.py`: 5 Hz learned policy plus deterministic safety wrapper
 - `src/weather_features.py`: canonical three-second weather/motion feature contract
@@ -240,7 +253,7 @@ Do not send raw hardware-specific fields directly into the models. A future
 sensor gateway should first map GPS/IMU/CAN/perception outputs into the same
 ego-relative physical signals used by `features.py` (ego motion, current-front
 object, adjacent front/rear objects, pedestrian, and lane-clear flags). The
-three-second summarizer and saved model interface can then remain unchanged.
+one-second 2 Hz summarizer and saved model interface can then remain unchanged.
 Unity remains downstream of `TwinSnapshot`, so replacing the Python simulator
 does not require Unity to understand the training datasets or model library.
 The reliability models have the same boundary: a gateway may publish the
