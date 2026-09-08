@@ -116,12 +116,43 @@ public class TwinSessionInfo
 }
 
 [Serializable]
+public class TwinTransportDiagnostics
+{
+    [Tooltip("Experiment run identifier supplied by the source; empty during normal operation.")]
+    public string runId;
+    public string profileId;
+    public int faultSeed;
+    public float packetLossPercent;
+    public float injectedDelayMilliseconds;
+    public float disconnectAtMeasurementSeconds = -1f;
+    public float disconnectDurationSeconds;
+    public float duplicatePercent;
+    public float outOfOrderPercent;
+    public float missingVehiclePercent;
+    public float invalidVehiclePercent;
+    public float missingActorsPercent;
+    public float experimentWarmupSeconds;
+    public float experimentDurationSeconds;
+    public float measurementElapsedSeconds = -1f;
+    public bool faultActive;
+    public long generatedMessages;
+    public long intentionallyDroppedMessages;
+    public long duplicateMessagesSent;
+    public long outOfOrderMessagesScheduled;
+    public long malformedMessagesSent;
+}
+
+[Serializable]
 public class TwinSnapshotMetadata
 {
     [Tooltip("Monotonically increasing within one source session.")]
     public long sequenceNumber;
     [Tooltip("Seconds on the source clock. For replay this is replay time.")]
     public double sourceTimestampSeconds;
+    [Tooltip("UTC Unix seconds immediately before a live source transmits this snapshot. Zero means unavailable.")]
+    public double sentTimestampUtcSeconds;
+    [Tooltip("Nominal publication rate declared by a streaming source. Zero means unavailable or not applicable.")]
+    public float nominalUpdateRateHz;
     [Tooltip("Unity real-time seconds when the state manager accepted the snapshot.")]
     public double receiptTimestampSeconds;
     [Tooltip("Optional source timeline duration in seconds; zero means unknown/live.")]
@@ -133,6 +164,8 @@ public class TwinSnapshotMetadata
     public string validityMessage;
     public TwinCoordinateFrame coordinateFrame = new TwinCoordinateFrame();
     public TwinSessionInfo session = new TwinSessionInfo();
+    [Tooltip("Optional source-side counters used by controlled transport experiments.")]
+    public TwinTransportDiagnostics transportDiagnostics;
 }
 
 [Serializable]

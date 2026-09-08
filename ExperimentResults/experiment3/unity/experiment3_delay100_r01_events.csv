@@ -1,0 +1,5 @@
+run_id,profile_id,experiment_elapsed_s,event_type,sequence_number,detail
+"delay100_r01","delay100",0,"measurement_started",-1,"delay100"
+"delay100_r01","delay100",1.414783,"state_became_stale",990,"holding_last_accepted_state"
+"delay100_r01","delay100",1.415581,"fresh_state_recovered",991,"recovery_ms=0.797"
+"delay100_r01","delay100",74.91201,"state_became_stale",3195,"holding_last_accepted_state"

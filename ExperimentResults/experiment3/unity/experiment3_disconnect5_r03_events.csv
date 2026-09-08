@@ -1,0 +1,6 @@
+run_id,profile_id,experiment_elapsed_s,event_type,sequence_number,detail
+"disconnect5_r03","disconnect5",0,"measurement_started",-1,"disconnect5"
+"disconnect5_r03","disconnect5",120.000851,"scheduled_outage_started",4550,"expected_start_s=120.000"
+"disconnect5_r03","disconnect5",120.968594,"state_became_stale",4550,"holding_last_accepted_state"
+"disconnect5_r03","disconnect5",125.000744,"scheduled_outage_ended",4550,"expected_end_s=125.000"
+"disconnect5_r03","disconnect5",125.002102,"fresh_state_recovered",4701,"recovery_ms=2.102"

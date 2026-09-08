@@ -26,6 +26,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
+try:
+    from simulated_faults import FaultConfig, FaultInjector, FaultRunLogger
+except ModuleNotFoundError:  # Imported as Tools.simulated_twin_stream in tests.
+    from Tools.simulated_faults import FaultConfig, FaultInjector, FaultRunLogger
+
 
 VALID = 1
 PARTIAL = 2
@@ -642,6 +647,12 @@ class SimulatedWorld:
         self.controller = self._new_controller()
         self.latest_sensors = SensorFrame()
         self.minimum_observed_clearance = math.inf
+        # A collision attempt is recorded before the non-penetration safety
+        # correction is applied. Keeping the correction makes long benchmark
+        # runs stable; recording the attempted overlap prevents it from hiding
+        # controller failures in closed-loop evaluation.
+        self.collision_actor_ids = set()
+        self.collision_intervention_count = 0
         self.scenario_planner = ProceduralScenarioPlanner(self.scenario_seed)
         self.next_event_z = self.scenario_planner.random.uniform(58.0, 75.0)
         self.generation_horizon = max(650.0, self.encounter_count * 95.0)
@@ -813,6 +824,7 @@ class SimulatedWorld:
                 )
                 maximum_ego_z = actor.z - required_gap
                 if self.ego_z > maximum_ego_z:
+                    self._record_collision_attempt(actor)
                     previously_separate_laterally = (
                         abs(previous_ego_x - actor.x) >= lateral_limit
                     )
@@ -842,8 +854,13 @@ class SimulatedWorld:
                 # continue blindly through it.
                 maximum_actor_z = self.ego_z - required_gap
                 if actor.z > maximum_actor_z:
+                    self._record_collision_attempt(actor)
                     actor.z = maximum_actor_z
                     actor.speed_mps = min(actor.speed_mps, self.speed_mps)
+
+    def _record_collision_attempt(self, actor: SimulatedActor) -> None:
+        self.collision_intervention_count += 1
+        self.collision_actor_ids.add(actor.actor_id)
 
     def visible_actors(self) -> List[SimulatedActor]:
         return [
@@ -1057,6 +1074,25 @@ def parse_arguments() -> argparse.Namespace:
         help="ML decisions per second; physics and safety still run at --rate. Default: 5",
     )
     parser.add_argument("--self-test", action="store_true", help="Run deterministic safety checks and exit.")
+    parser.add_argument("--run-id", default="", help="Unique Experiment 3 run ID; enables truth/result logging.")
+    parser.add_argument("--profile-id", default="baseline", help="Experiment 3 condition label.")
+    parser.add_argument("--fault-seed", type=int, default=901, help="Reproducible fault RNG seed.")
+    parser.add_argument("--packet-loss-percent", type=float, default=0.0)
+    parser.add_argument("--delay-ms", type=float, default=0.0)
+    parser.add_argument("--disconnect-at-measurement-s", type=float, default=-1.0)
+    parser.add_argument("--disconnect-duration-s", type=float, default=0.0)
+    parser.add_argument("--duplicate-percent", type=float, default=0.0)
+    parser.add_argument("--out-of-order-percent", type=float, default=0.0)
+    parser.add_argument("--missing-vehicle-percent", type=float, default=0.0)
+    parser.add_argument("--invalid-vehicle-percent", type=float, default=0.0)
+    parser.add_argument("--missing-actors-percent", type=float, default=0.0)
+    parser.add_argument("--experiment-warmup", type=float, default=30.0)
+    parser.add_argument("--experiment-duration", type=float, default=300.0)
+    parser.add_argument(
+        "--experiment-output-dir",
+        type=Path,
+        default=project_root / "ExperimentResults" / "experiment3" / "python",
+    )
     return parser.parse_args()
 
 
@@ -1211,6 +1247,21 @@ def run_self_test(
 
 def main() -> None:
     arguments = parse_arguments()
+    percentages = (
+        arguments.packet_loss_percent,
+        arguments.duplicate_percent,
+        arguments.out_of_order_percent,
+        arguments.missing_vehicle_percent,
+        arguments.invalid_vehicle_percent,
+        arguments.missing_actors_percent,
+    )
+    if any(value < 0.0 or value > 100.0 for value in percentages):
+        raise SystemExit("All Experiment 3 percentage values must be between 0 and 100.")
+    fault_requested = any(value > 0.0 for value in percentages) or arguments.delay_ms > 0.0 or (
+        arguments.disconnect_at_measurement_s >= 0.0 and arguments.disconnect_duration_s > 0.0
+    )
+    if fault_requested and not arguments.run_id:
+        raise SystemExit("Fault injection requires a unique --run-id so the evidence can be matched safely.")
     controller_factory: Optional[Callable[[], Any]] = None
     if arguments.controller == "ml":
         project_root = Path(__file__).resolve().parents[1]
@@ -1266,6 +1317,28 @@ def main() -> None:
     control_socket.bind((arguments.control_host, arguments.control_port))
     control_socket.setblocking(False)
     unity_target = (arguments.unity_host, arguments.data_port)
+    fault_config = FaultConfig(
+        run_id=arguments.run_id,
+        profile_id=arguments.profile_id,
+        rate_hz=rate_hz,
+        seed=arguments.fault_seed,
+        packet_loss_percent=arguments.packet_loss_percent,
+        delay_ms=max(0.0, arguments.delay_ms),
+        disconnect_at_s=arguments.disconnect_at_measurement_s,
+        disconnect_duration_s=max(0.0, arguments.disconnect_duration_s),
+        duplicate_percent=arguments.duplicate_percent,
+        out_of_order_percent=arguments.out_of_order_percent,
+        missing_vehicle_percent=arguments.missing_vehicle_percent,
+        invalid_vehicle_percent=arguments.invalid_vehicle_percent,
+        missing_actors_percent=arguments.missing_actors_percent,
+        warmup_s=max(0.0, arguments.experiment_warmup),
+        duration_s=max(1.0, arguments.experiment_duration),
+    )
+    fault_injector = FaultInjector(fault_config)
+    try:
+        fault_logger = FaultRunLogger(fault_config, arguments.experiment_output_dir)
+    except FileExistsError as exception:
+        raise SystemExit(str(exception))
     world = SimulatedWorld(
         include_actors=not arguments.no_actors,
         configured_seed=arguments.seed,
@@ -1282,6 +1355,7 @@ def main() -> None:
     last_update_time = time.perf_counter()
     next_send_time = last_update_time
     last_status_print = last_update_time
+    experiment_started_at: Optional[float] = last_update_time if arguments.autostart else None
 
     print()
     print("RoadWeave procedural simulated stream")
@@ -1289,6 +1363,13 @@ def main() -> None:
     print(f"Listening for Unity controls on {arguments.control_host}:{arguments.control_port}")
     print(f"Rate: {rate_hz:.1f} Hz")
     print("Controller: {}".format(arguments.controller))
+    if fault_config.enabled:
+        print(
+            "Experiment 3: run={} profile={} fault-seed={}".format(
+                fault_config.run_id, fault_config.profile_id, fault_config.seed
+            )
+        )
+        print("Truth log: {}".format(fault_logger.truth_path))
     if arguments.controller == "ml":
         print("ML decision rate: {:.1f} Hz".format(arguments.ml_decision_rate))
     print(
@@ -1304,6 +1385,8 @@ def main() -> None:
                 if command == "START":
                     stream_enabled = True
                     driving = True
+                    if experiment_started_at is None:
+                        experiment_started_at = now
                     last_update_time = now
                     next_send_time = now
                     print("Unity command: START")
@@ -1312,26 +1395,38 @@ def main() -> None:
                     print("Unity command: PAUSE")
                 elif command == "RESET_START":
                     world.reset()
+                    fault_injector.reset()
                     sequence_number = 0
                     stream_enabled = True
                     driving = True
+                    experiment_started_at = now
                     last_update_time = now
                     next_send_time = now
                     print("Unity command: RESET_START")
                 elif command == "RESET_PAUSE":
                     world.reset()
+                    fault_injector.reset()
                     sequence_number = 0
                     stream_enabled = True
                     driving = False
+                    experiment_started_at = None
                     last_update_time = now
                     next_send_time = now
                     print("Unity command: RESET_PAUSE")
                 elif command == "STOP":
                     stream_enabled = False
                     driving = False
+                    experiment_started_at = None
                     print("Unity command: STOP")
                 else:
                     print(f"Unknown Unity command: {command}")
+
+            for pending_payload in fault_injector.pop_due(now):
+                try:
+                    data_socket.sendto(pending_payload, unity_target)
+                except OSError as exception:
+                    if now - last_status_print >= 1.0:
+                        print(f"Scheduled snapshot send skipped: {exception}")
 
             if not stream_enabled:
                 last_update_time = now
@@ -1353,8 +1448,27 @@ def main() -> None:
                 include_route=include_route,
             )
             try:
-                json_bytes = encode_snapshot_for_udp(snapshot)
-                data_socket.sendto(json_bytes, unity_target)
+                # Experiment 2 uses a common UTC clock because the Python
+                # sender and Unity currently run on the same Mac. Keep this
+                # separate from sourceTimestampSeconds, which is simulation
+                # time rather than a transport timestamp.
+                generation_utc = time.time()
+                snapshot["metadata"]["sentTimestampUtcSeconds"] = generation_utc
+                snapshot["metadata"]["nominalUpdateRateHz"] = rate_hz
+                measurement_elapsed = (
+                    -1.0
+                    if experiment_started_at is None
+                    else now - experiment_started_at - fault_config.warmup_s
+                )
+                fault_logger.write_truth(snapshot, generation_utc, measurement_elapsed)
+                fault_injector.submit(
+                    snapshot,
+                    now,
+                    measurement_elapsed,
+                    encode_snapshot_for_udp,
+                )
+                for pending_payload in fault_injector.pop_due(now):
+                    data_socket.sendto(pending_payload, unity_target)
             except (OSError, ValueError) as exception:
                 # A transient transport-size or socket failure must not end a
                 # live simulation session. The next 30 Hz update can recover.
@@ -1379,6 +1493,7 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nStopping RoadWeave simulated stream.")
     finally:
+        fault_logger.close(fault_injector)
         world.close()
         data_socket.close()
         control_socket.close()

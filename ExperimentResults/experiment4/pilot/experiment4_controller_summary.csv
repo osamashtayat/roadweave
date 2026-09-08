@@ -1,0 +1,27 @@
+metric,metric_label,preferred_direction,controller,n,mean,sample_sd,median,ci95_lower,ci95_upper
+route_progress_m,Route progress (m),higher,Rule Controller,3,902.7577569664869,61.23304211336036,882.1028517903268,854.5231346632223,971.6472844459114
+route_progress_m,Route progress (m),higher,Hybrid ML Controller,3,919.1253180116595,102.04648136180518,866.6592947282597,853.9856222460345,1036.731037060684
+collision_count,Collision count,lower,Rule Controller,3,0.3333333333333333,0.5773502691896258,0.0,0.0,1.0
+collision_count,Collision count,lower,Hybrid ML Controller,3,0.3333333333333333,0.5773502691896258,0.0,0.0,1.0
+minimum_ttc_s,Minimum TTC (s),higher,Rule Controller,3,0.4536721601474211,0.2821472568675159,0.5123444267076277,0.1468017976083306,0.7018702561263049
+minimum_ttc_s,Minimum TTC (s),higher,Hybrid ML Controller,3,0.6366405611380159,0.18599680013404538,0.5544420917538888,0.5059045014831844,0.8495750901769745
+minimum_clearance_m,Minimum clearance (m),higher,Rule Controller,3,1.3864753657456816,0.16313123800930018,1.4566478303896837,1.1999999999999549,1.5027782668474066
+minimum_clearance_m,Minimum clearance (m),higher,Hybrid ML Controller,3,1.3916316033720844,0.16893625136293072,1.4558649183553976,1.1999999999999549,1.5190298917609004
+emergency_stops,Emergency stops,lower,Rule Controller,3,2.6666666666666665,1.1547005383792515,2.0,2.0,4.0
+emergency_stops,Emergency stops,lower,Hybrid ML Controller,3,2.3333333333333335,0.5773502691896258,2.0,2.0,3.0
+deadlock_duration_s,Deadlock duration (s),lower,Rule Controller,3,5.383333333333322,1.7148858076657212,4.599999999999992,4.199999999999993,7.349999999999983
+deadlock_duration_s,Deadlock duration (s),lower,Hybrid ML Controller,3,0.2666666666666667,0.4618802153517007,0.0,0.0,0.8000000000000002
+overtake_attempts,Overtake attempts,context,Rule Controller,3,5.666666666666667,0.5773502691896258,6.0,5.0,6.0
+overtake_attempts,Overtake attempts,context,Hybrid ML Controller,3,5.0,1.0,5.0,4.0,6.0
+successful_overtakes,Successful overtakes,higher,Rule Controller,3,3.6666666666666665,0.5773502691896258,4.0,3.0,4.0
+successful_overtakes,Successful overtakes,higher,Hybrid ML Controller,3,3.3333333333333335,1.1547005383792515,4.0,2.0,4.0
+overtake_success_rate,Overtake success rate,higher,Rule Controller,3,0.6444444444444444,0.03849001794597504,0.6666666666666666,0.6,0.6666666666666666
+overtake_success_rate,Overtake success rate,higher,Hybrid ML Controller,3,0.6555555555555556,0.1503083250940965,0.6666666666666666,0.5,0.8000000000000002
+mean_absolute_acceleration_mps2,Mean absolute acceleration (m/s²),lower,Rule Controller,3,0.9843311565168587,0.1405020552668438,0.9785900645985532,0.8467876453738238,1.127615759578199
+mean_absolute_acceleration_mps2,Mean absolute acceleration (m/s²),lower,Hybrid ML Controller,3,1.0320519517522377,0.05135512422679479,1.0296277457881706,0.981951861218184,1.084576248250358
+maximum_absolute_jerk_mps3,Maximum absolute jerk (m/s³),lower,Rule Controller,3,93.24728657003833,11.473212723735394,99.7418597101266,79.99999999998835,100.0
+maximum_absolute_jerk_mps3,Maximum absolute jerk (m/s³),lower,Hybrid ML Controller,3,98.3187251453386,2.9120534697615015,100.0,94.95617543601584,100.0
+mean_absolute_yaw_rate_deg_s,Mean absolute yaw rate (deg/s),lower,Rule Controller,3,2.692849551016563,0.37191805772286185,2.6464806679824058,2.3462901803136536,3.085777804753629
+mean_absolute_yaw_rate_deg_s,Mean absolute yaw rate (deg/s),lower,Hybrid ML Controller,3,2.2664762738557886,0.09930732884063184,2.228625856303939,2.191660056464707,2.37914290879872
+scenario_completion_rate,Scenario success rate,higher,Rule Controller,3,0.8611111111111112,0.1272937693043289,0.8333333333333334,0.75,1.0
+scenario_completion_rate,Scenario success rate,higher,Hybrid ML Controller,3,0.9027777777777778,0.08673608331108884,0.875,0.8333333333333334,1.0

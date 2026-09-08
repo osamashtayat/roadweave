@@ -1,0 +1,4 @@
+run_id,profile_id,experiment_elapsed_s,event_type,sequence_number,detail
+"baseline_r03","baseline",0,"measurement_started",-1,"baseline"
+"baseline_r03","baseline",134.689919,"state_became_stale",4958,"holding_last_accepted_state"
+"baseline_r03","baseline",134.696739,"fresh_state_recovered",4959,"recovery_ms=6.821"

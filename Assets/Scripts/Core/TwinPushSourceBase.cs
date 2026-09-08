@@ -15,6 +15,8 @@ public abstract class TwinPushSourceBase : MonoBehaviour, ITwinStateSource, ITwi
 
     public TwinSessionInfo Session { get; private set; }
     public bool CanStart => Session != null && Session.status != TwinSessionStatus.Error;
+    public long RejectedContractSnapshotCount { get; private set; }
+    public long RejectedMalformedJsonCount { get; private set; }
     public event Action<TwinSnapshot> SnapshotProduced;
     public event Action<TwinSessionInfo> SessionChanged;
 
@@ -66,6 +68,7 @@ public abstract class TwinPushSourceBase : MonoBehaviour, ITwinStateSource, ITwi
             return false;
         if (!ValidateRequiredDomains(snapshot, out string validationError))
         {
+            RejectedContractSnapshotCount++;
             Debug.LogWarning($"Rejected {SourceKind} snapshot: {validationError}");
             return false;
         }
@@ -85,6 +88,7 @@ public abstract class TwinPushSourceBase : MonoBehaviour, ITwinStateSource, ITwi
         try { snapshot = JsonUtility.FromJson<TwinSnapshot>(json); }
         catch (Exception exception)
         {
+            RejectedMalformedJsonCount++;
             // A malformed datagram is a message-level failure, not a permanent
             // source-session failure. The next valid live message may continue.
             Debug.LogWarning($"Could not parse snapshot JSON: {exception.Message}");
@@ -92,6 +96,7 @@ public abstract class TwinPushSourceBase : MonoBehaviour, ITwinStateSource, ITwi
         }
         if (snapshot == null)
         {
+            RejectedMalformedJsonCount++;
             Debug.LogWarning("Snapshot JSON produced no digital-twin state.");
             return false;
         }

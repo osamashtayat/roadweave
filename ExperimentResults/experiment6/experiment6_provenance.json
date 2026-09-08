@@ -1,0 +1,19 @@
+{
+  "experiment": 6,
+  "generated_graphs": [
+    21,
+    22,
+    24
+  ],
+  "pending_graphs": [
+    23
+  ],
+  "source_file_hashes_sha256": {
+    "ML/data/processed/sensor_reliability.parquet": "981b1294a76c37466ecc57d83761f71f993ebe5331e61295be30352d6a0366ac",
+    "ML/reports/sensor_reliability_metrics.json": "f42c4f5c0e130e0bf699e29e68b326610be21dc5a9aa48d55efe356301d7d646",
+    "ML/reports/sensor_reliability_predictions.csv": "cf24e81e4426f9e51d9a0bf4b6e015add0e536a5c3d16f64e0fbefba2e6c4da3",
+    "ML/reports/weather_metrics.json": "90d838b4893a867773c28679589fb4c6067318f55f86e903c17ce47933463918",
+    "ML/reports/weather_test_predictions.csv": "cf47e65e08e9b951a646dbf847f71da5f5919792fcdcd6b6873d6891c54b4e44"
+  },
+  "all_source_validation_checks_passed": true
+}

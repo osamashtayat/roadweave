@@ -1,0 +1,7 @@
+task,check,passed,observed,expected
+risk,test_row_count_matches_metrics,True,7962,7962
+risk,confusion_matrix_matches_metrics,True,"[[4884, 351, 156, 4], [187, 780, 143, 1], [89, 155, 754, 43], [33, 43, 51, 288]]","[[4884, 351, 156, 4], [187, 780, 143, 1], [89, 155, 754, 43], [33, 43, 51, 288]]"
+risk,macro_f1_matches_metrics,True,0.7579764408425885,0.7579764408425885
+policy,test_row_count_matches_metrics,True,7962,7962
+policy,confusion_matrix_matches_metrics,True,"[[4993, 351, 345, 165, 164], [127, 698, 19, 31, 28], [113, 17, 508, 20, 29], [53, 30, 25, 61, 3], [41, 35, 16, 8, 82]]","[[4993, 351, 345, 165, 164], [127, 698, 19, 31, 28], [113, 17, 508, 20, 29], [53, 30, 25, 61, 3], [41, 35, 16, 8, 82]]"
+policy,macro_f1_matches_metrics,True,0.5609135790528582,0.5609135790528583

@@ -1,0 +1,4 @@
+run_id,profile_id,experiment_elapsed_s,event_type,sequence_number,detail
+"loss05_r01","loss05",0,"measurement_started",-1,"loss05"
+"loss05_r01","loss05",282.807972,"state_became_stale",9390,"holding_last_accepted_state"
+"loss05_r01","loss05",282.811085,"fresh_state_recovered",9391,"recovery_ms=3.113"

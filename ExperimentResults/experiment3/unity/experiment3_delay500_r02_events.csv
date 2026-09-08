@@ -1,0 +1,2 @@
+run_id,profile_id,experiment_elapsed_s,event_type,sequence_number,detail
+"delay500_r02","delay500",0,"measurement_started",-1,"delay500"

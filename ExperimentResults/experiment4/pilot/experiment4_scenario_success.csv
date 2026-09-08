@@ -1,0 +1,11 @@
+scenario_category,scenario_label,controller,successes,evaluable_common_scenarios,success_rate
+pedestrian,Pedestrian,Rule Controller,6,6,1.0
+pedestrian,Pedestrian,Hybrid ML Controller,6,6,1.0
+stopped_car,Stopped car,Rule Controller,4,4,1.0
+stopped_car,Stopped car,Hybrid ML Controller,4,4,1.0
+slow_car,Slow car,Rule Controller,0,2,0.0
+slow_car,Slow car,Hybrid ML Controller,1,2,0.5
+truck,Truck,Rule Controller,2,3,0.6666666666666666
+truck,Truck,Hybrid ML Controller,2,3,0.6666666666666666
+mixed,Mixed,Rule Controller,4,4,1.0
+mixed,Mixed,Hybrid ML Controller,4,4,1.0

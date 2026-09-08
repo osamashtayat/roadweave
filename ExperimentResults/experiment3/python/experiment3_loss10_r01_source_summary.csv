@@ -1,0 +1,2 @@
+run_id,profile_id,rate_hz,fault_seed,packet_loss_percent,delay_ms,disconnect_at_s,disconnect_duration_s,duplicate_percent,out_of_order_percent,missing_vehicle_percent,invalid_vehicle_percent,missing_actors_percent,generated_messages,intentionally_dropped_messages,duplicate_messages_sent,out_of_order_messages_scheduled,malformed_messages_sent
+loss10_r01,loss10,30.0,901,10.0,0.0,-1.0,0.0,0.0,0.0,0.0,0.0,0.0,9000,863,0,0,0

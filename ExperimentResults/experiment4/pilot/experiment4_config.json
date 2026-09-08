@@ -1,0 +1,42 @@
+{
+  "benchmark_version": 3,
+  "controllers": [
+    "Rule Controller",
+    "Hybrid ML Controller"
+  ],
+  "seed_start": 2026000,
+  "seed_count": 3,
+  "seeds": [
+    2026000,
+    2026001,
+    2026002
+  ],
+  "duration_seconds": 120.0,
+  "dt_seconds": 0.05,
+  "comfort_warmup_seconds": 2.0,
+  "scenario_resolution_allowance_seconds": 30.0,
+  "scenario_deadlock_limit_seconds": 5.0,
+  "model_hashes_sha256": {
+    "risk_model.joblib": "90256de2c13bc6b85b2b0e8e51e384587b325bc45a5b8154cf8e4fbf87b2e6b4",
+    "policy_model.joblib": "d10146ddd7e0f3eb896937871e587232169fe160c3de87bc917728810681b7e4"
+  },
+  "code_hashes_sha256": {
+    "Tools/benchmark_controllers.py": "d62bd98e216f4e5e9489559d410c34b1a6dbd2a341a3cd1fd93df1d63e94a828",
+    "Tools/analyze_experiment4.py": "35d62981e4c726903fd47d4dea3e5d0db34cc491e4ca4262b08a70289ffdfc56",
+    "Tools/simulated_twin_stream.py": "61c5acc3e141d90a45394768d9f5b734d447387f07053b03b87d11fd94b29661",
+    "ML/src/online_policy.py": "c1334a1624ab739eb27df7736c893a2af8d0cb1cb12b38bc25a8da8d90460c8c"
+  },
+  "environment": {
+    "python": "3.9.6",
+    "platform": "macOS-26.2-arm64-arm-64bit",
+    "packages": {
+      "numpy": "1.26.4",
+      "pandas": "2.3.3",
+      "scipy": "1.13.1",
+      "scikit-learn": "1.6.1",
+      "matplotlib": "3.9.4",
+      "joblib": "1.5.3"
+    }
+  },
+  "wall_clock_runtime_seconds": 68.106368833
+}

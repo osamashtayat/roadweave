@@ -1,0 +1,3 @@
+transfer_direction,training_source,evaluation_source,risk_macro_f1,policy_macro_f1
+nuScenes → K-Risk,nuscenes,krisk,0.5010825296143604,0.37656445794632665
+K-Risk → nuScenes,krisk,nuscenes,0.288238250150415,0.48764390654843587

@@ -1,0 +1,6 @@
+run_id,profile_id,experiment_elapsed_s,event_type,sequence_number,detail
+"loss20_r02","loss20",0,"measurement_started",-1,"loss20"
+"loss20_r02","loss20",76.980133,"state_became_stale",3211,"holding_last_accepted_state"
+"loss20_r02","loss20",76.982353,"fresh_state_recovered",3212,"recovery_ms=2.220"
+"loss20_r02","loss20",87.395721,"state_became_stale",3524,"holding_last_accepted_state"
+"loss20_r02","loss20",119.34285,"state_became_stale",4483,"holding_last_accepted_state"

@@ -1,0 +1,13 @@
+evidence,condition,check,passed,observed,expected
+sensor,CAMERA,test_rows_match,True,1698,1698
+sensor,CAMERA,ml_mae_matches_saved_report,True,0.013690182755688174,0.013690182755688177
+sensor,CAMERA,confidence_mae_matches_saved_report,True,0.11525562124613144,0.11525562124613144
+sensor,LIDAR,test_rows_match,True,1698,1698
+sensor,LIDAR,ml_mae_matches_saved_report,True,0.01713175944837958,0.017131759448379583
+sensor,LIDAR,confidence_mae_matches_saved_report,True,0.15110078437105826,0.15110078437105826
+sensor,RADAR,test_rows_match,True,1698,1698
+sensor,RADAR,ml_mae_matches_saved_report,True,0.016789361020414874,0.016789361020414877
+sensor,RADAR,confidence_mae_matches_saved_report,True,0.11540311939544706,0.11540311939544706
+weather,OVERALL,validation_rows_match,True,1918,1918
+weather,OVERALL,ml_mae_matches_saved_report,True,0.14013712048810195,0.14013712048810192
+weather,OVERALL,fixed_rule_mae_matches_saved_report,True,0.1842636861313869,0.1842636861313869

@@ -138,3 +138,10 @@ __pycache__/
 *.tgz.meta
 *.gz
 *.gz.meta
+
+# Raw experiment recordings are large and can be regenerated locally.
+# Keep experiment summaries, analysis tables, figures, and protocols in Git.
+/ExperimentResults/**/*_frames.csv
+/ExperimentResults/**/*_snapshots.csv
+/ExperimentResults/**/*_samples.csv
+/ExperimentResults/**/*_truth.csv

@@ -1,0 +1,2 @@
+run_id,profile_id,experiment_elapsed_s,event_type,sequence_number,detail
+"loss10_r02","loss10",0,"measurement_started",-1,"loss10"

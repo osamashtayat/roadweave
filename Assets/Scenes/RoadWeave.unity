@@ -590,6 +590,9 @@ GameObject:
   - component: {fileID: 75759233}
   - component: {fileID: 75759232}
   - component: {fileID: 75759231}
+  - component: {fileID: 75759235}
+  - component: {fileID: 75759236}
+  - component: {fileID: 75759237}
   m_Layer: 0
   m_Name: DigitalTwinSystem
   m_TagString: Untagged
@@ -751,6 +754,68 @@ MonoBehaviour:
   testLabPanel: {fileID: 791291446}
   modeStatusText: {fileID: 1315992251}
   resumeReplayWhenReturning: 1
+--- !u!114 &75759235
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 75759225}
+  m_Enabled: 0
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 65f1a0b2c7d849b59b29c153e6c709ef, type: 3}
+  m_Name:
+  m_EditorClassIdentifier: Assembly-CSharp::SourceExperimentRecorder
+  stateManager: {fileID: 75759230}
+  measurementDurationSeconds: 15
+  outputFolderName: ExperimentResults
+  recordAutomatically: 1
+--- !u!114 &75759236
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 75759225}
+  m_Enabled: 0
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 8e0cebc8077e4d23af6ad3f377dd4311, type: 3}
+  m_Name:
+  m_EditorClassIdentifier: Assembly-CSharp::UpdateRateExperimentRecorder
+  stateManager: {fileID: 75759230}
+  transport: {fileID: 1252002546}
+  displayedEgoVehicle: {fileID: 1154259288}
+  warmupDurationSeconds: 30
+  measurementDurationSeconds: 300
+  sourceDataTimeoutSeconds: 5
+  outputFolderName: ExperimentResults/experiment2
+  recordAutomatically: 1
+  detectCanonicalActorOverlap: 1
+  stopRunOnCollision: 1
+  egoCollisionDimensionsMeters: {x: 1.9, y: 1.5, z: 4.6}
+  overlapEnvelopeScale: 0.9
+--- !u!114 &75759237
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 75759225}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 7fb4df52e1b5447da3d8b3dbb2ec934a, type: 3}
+  m_Name:
+  m_EditorClassIdentifier: Assembly-CSharp::FaultInjectionExperimentRecorder
+  stateManager: {fileID: 75759230}
+  transport: {fileID: 1252002546}
+  simulatedSource: {fileID: 1252002547}
+  displayedEgoVehicle: {fileID: 1154259288}
+  warmupDurationSeconds: 30
+  measurementDurationSeconds: 300
+  maximumExpectedSilenceSeconds: 15
+  outputFolderName: ExperimentResults/experiment3/unity
+  recordAutomatically: 1
+  requireExperimentRunId: 1
 --- !u!1001 &83382453
 PrefabInstance:
   m_ObjectHideFlags: 0

@@ -43,6 +43,9 @@ public class DigitalTwinStateManager : MonoBehaviour, ITwinSnapshotSink
     public bool IsFresh => CurrentSnapshot != null && CurrentSnapshot.metadata.freshness == TwinDataFreshness.Fresh;
     public ITwinSessionControl SessionControl => connectedSource as ITwinSessionControl;
     public ITwinStateSource ConnectedSource => connectedSource;
+    public long RejectedInvalidSnapshotCount { get; private set; }
+    public long RejectedDuplicateSnapshotCount { get; private set; }
+    public long RejectedOutOfOrderSnapshotCount { get; private set; }
 
     public event Action Initialized;
     public event Action StateUpdated;
@@ -50,6 +53,7 @@ public class DigitalTwinStateManager : MonoBehaviour, ITwinSnapshotSink
     public event Action<ReplayStatus> StatusChanged;
     public event Action<TwinSessionInfo> SessionChanged;
     public event Action<ITwinStateSource> SourceChanged;
+    public event Action<TwinSnapshot, string> SnapshotRejected;
 
     private static readonly TwinEgoState emptyEgo = new TwinEgoState();
     private static readonly TwinVehicleState emptyVehicle = new TwinVehicleState();
@@ -114,6 +118,8 @@ public class DigitalTwinStateManager : MonoBehaviour, ITwinSnapshotSink
     {
         if (!ValidateSnapshot(snapshot, out string validationError))
         {
+            RejectedInvalidSnapshotCount++;
+            SnapshotRejected?.Invoke(snapshot, "invalid:" + validationError);
             Debug.LogWarning($"Rejected digital-twin snapshot: {validationError}");
             return false;
         }
@@ -128,6 +134,12 @@ public class DigitalTwinStateManager : MonoBehaviour, ITwinSnapshotSink
 
         if (rejectOutOfOrderSnapshots && snapshot.metadata.sequenceNumber <= acceptedSequence)
         {
+            bool duplicate = snapshot.metadata.sequenceNumber == acceptedSequence;
+            if (duplicate)
+                RejectedDuplicateSnapshotCount++;
+            else
+                RejectedOutOfOrderSnapshotCount++;
+            SnapshotRejected?.Invoke(snapshot, duplicate ? "duplicate_sequence" : "out_of_order_sequence");
             Debug.LogWarning($"Rejected out-of-order snapshot {snapshot.metadata.sequenceNumber}; last accepted is {acceptedSequence}.");
             return false;
         }

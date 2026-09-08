@@ -1,0 +1,6 @@
+input_rate_hz,independent_runs_n,scheduled_mean,raw_transport_received_mean,unique_applied_mean,missing_scheduled_mean,scheduled_sequence_coverage_percent,raw_transport_minus_scheduled_mean,accounting_note
+2,3,600.000000,601.000000,600.000000,0.000000,100.000000,1.000000,Raw transport counters are sampled at Unity frame boundaries; unique sequence coverage is the primary outcome.
+10,3,3000.000000,3000.333333,3000.000000,0.000000,100.000000,0.333333,Raw transport counters are sampled at Unity frame boundaries; unique sequence coverage is the primary outcome.
+30,3,9000.000000,9000.000000,9000.000000,0.000000,100.000000,0.000000,Raw transport counters are sampled at Unity frame boundaries; unique sequence coverage is the primary outcome.
+50,3,15000.000000,15000.000000,15000.000000,0.000000,100.000000,0.000000,Raw transport counters are sampled at Unity frame boundaries; unique sequence coverage is the primary outcome.
+100,3,29998.666667,29999.000000,29998.666667,0.000000,100.000000,0.333333,Raw transport counters are sampled at Unity frame boundaries; unique sequence coverage is the primary outcome.
